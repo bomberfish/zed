@@ -62,6 +62,12 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod prompts;
 
+/// True when running as a headless embed (`ZED_EMBED_SOCKET` set). Used to
+/// commit typed characters through the input handler, since there is no OS IME
+/// to do it (see `dispatch_key_event`).
+static IS_EMBEDDED_INPUT: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("ZED_EMBED_SOCKET").is_some());
+
 pub use a11y::A11ySubtreeBuilder;
 
 use self::a11y::A11y;
@@ -5037,6 +5043,20 @@ impl Window {
 
         self.finish_dispatch_key_event(event, dispatch_path, match_result.context_stack, cx);
         self.pending_input_changed(cx);
+
+        // Embedded (headless) input has no OS IME to commit typed text, so if a
+        // printable key wasn't consumed by a binding, insert it ourselves via the
+        // focused input handler — mirroring `dispatch_keystroke`. Without this,
+        // keybindings work but typing does nothing.
+        if cx.propagate_event
+            && *IS_EMBEDDED_INPUT
+            && let Some(key_down) = event.downcast_ref::<KeyDownEvent>()
+            && let Some(input) = key_down.keystroke.key_char.clone()
+            && let Some(mut input_handler) = self.platform_window.take_input_handler()
+        {
+            input_handler.dispatch_input(&input, self, cx);
+            self.platform_window.set_input_handler(input_handler);
+        }
     }
 
     fn finish_dispatch_key_event(

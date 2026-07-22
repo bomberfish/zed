@@ -5357,6 +5357,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmabuf_poc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "libc",
+ "nix 0.29.0",
+ "pollster 0.4.0",
+ "wgpu",
+]
+
+[[package]]
 name = "docs_preprocessor"
 version = "0.1.0"
 dependencies = [
@@ -7890,6 +7902,7 @@ dependencies = [
  "itertools 0.14.0",
  "libc",
  "log",
+ "nix 0.29.0",
  "notify-rust",
  "oo7",
  "open",
@@ -8044,6 +8057,7 @@ name = "gpui_wgpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "bytemuck",
  "collections",
  "cosmic-text",

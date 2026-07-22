@@ -186,6 +186,16 @@ static ZED_WINDOW_POSITION: LazyLock<Option<Point<Pixels>>> = LazyLock::new(|| {
         .and_then(parse_pixel_position_env_var)
 });
 
+/// Whether Zed is rendering as a headless embed (into another process via
+/// `ZED_EMBED_SOCKET`). Used to drop window chrome — like the title bar — that
+/// is meaningless when embedded in a host application's tab.
+static IS_EMBEDDED_HEADLESS: LazyLock<bool> =
+    LazyLock::new(|| env::var_os("ZED_EMBED_SOCKET").is_some());
+
+fn is_embedded_headless() -> bool {
+    *IS_EMBEDDED_HEADLESS
+}
+
 pub trait TerminalProvider {
     fn spawn(
         &self,
@@ -9058,7 +9068,13 @@ impl Render for Workspace {
             // a tab group: region navigation lands on the first control (per
             // the ARIA toolbar pattern), Tab steps through them, and arrow keys
             // move between them once focus is inside.
-            .when_some(self.titlebar_item.clone(), |this, item| {
+            // Drop the title bar when running as a headless embed — window
+            // controls / project chrome make no sense rendered into another app.
+            .when_some(
+                self.titlebar_item
+                    .clone()
+                    .filter(|_| !is_embedded_headless()),
+                |this, item| {
                 this.child(
                     div()
                         .id("titlebar-region")

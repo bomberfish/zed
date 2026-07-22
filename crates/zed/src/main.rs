@@ -197,6 +197,174 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 }
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
+/// When embedded in a host application, poll for the host's palette (streamed in
+/// over the embed socket into the gpui bridge) and re-theme the editor to match.
+fn init_embed_theme(cx: &mut gpui::App) {
+    if std::env::var_os("ZED_EMBED_SOCKET").is_none() {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        use theme::ActiveTheme as _;
+        let mut last_version = 0u64;
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            cx.update(|cx| {
+                if let Some((version, palette)) = gpui::embed_palette::embed_palette() {
+                    // Re-apply on a new palette, or whenever something else
+                    // (async user-theme load, `reload_theme`, settings changes)
+                    // has reverted the active theme away from ours.
+                    let is_ours = cx.theme().name.as_ref() == "Slop";
+                    if version != last_version || !is_ours {
+                        last_version = version;
+                        apply_embed_palette(cx, palette);
+                    }
+                }
+            });
+        }
+    })
+    .detach();
+}
+
+/// Recolor the active theme from the host palette and make it current. Only the
+/// color surfaces are overridden; syntax/other styles are kept from the base
+/// theme. Order matches slop2's `Palette`.
+fn apply_embed_palette(cx: &mut gpui::App, palette: gpui::embed_palette::EmbedPalette) {
+    use theme::{ActiveTheme, GlobalTheme, Theme};
+
+    let color = |index: usize| -> gpui::Hsla { gpui::rgba(palette.colors[index]).into() };
+    let fg = color(0);
+    let fg_dim = color(1);
+    let fg_muted = color(2);
+    let fg_subtle = color(3);
+    let bg = color(4);
+    let bg_alt = color(5);
+    let accent = color(6);
+    let accent_alt = color(7);
+    let purple = color(8);
+    let red = color(9);
+    let green = color(10);
+    let yellow = color(11);
+    let yellow_bright = color(12);
+
+    let base = cx.theme().clone();
+    let mut styles = base.styles.clone();
+    {
+        let c = &mut styles.colors;
+        // Surfaces.
+        c.background = bg;
+        c.editor_background = bg;
+        c.editor_gutter_background = bg;
+        c.tab_active_background = bg;
+        c.surface_background = bg_alt;
+        c.elevated_surface_background = bg_alt;
+        c.panel_background = bg_alt;
+        c.status_bar_background = bg_alt;
+        c.title_bar_background = bg_alt;
+        c.title_bar_inactive_background = bg_alt;
+        c.toolbar_background = bg_alt;
+        c.tab_bar_background = bg_alt;
+        c.tab_inactive_background = bg_alt;
+        // Borders.
+        c.border = bg_alt;
+        c.border_variant = bg_alt;
+        c.border_focused = accent;
+        c.border_selected = accent;
+        c.pane_group_border = bg_alt;
+        c.pane_focused_border = accent;
+        // Text + icons.
+        c.text = fg;
+        c.editor_foreground = fg;
+        c.text_muted = fg_muted;
+        c.text_placeholder = fg_subtle;
+        c.text_disabled = fg_subtle;
+        c.text_accent = accent;
+        c.icon = fg_dim;
+        c.icon_muted = fg_muted;
+        c.icon_disabled = fg_subtle;
+        c.icon_accent = accent;
+        c.editor_line_number = fg_subtle;
+        c.editor_active_line_number = fg;
+        // Integrated terminal ANSI palette.
+        c.terminal_background = bg;
+        c.terminal_ansi_background = bg;
+        c.terminal_foreground = fg;
+        c.terminal_bright_foreground = fg;
+        c.terminal_dim_foreground = fg_muted;
+        c.terminal_ansi_black = bg;
+        c.terminal_ansi_red = red;
+        c.terminal_ansi_green = green;
+        c.terminal_ansi_yellow = yellow;
+        c.terminal_ansi_blue = accent;
+        c.terminal_ansi_magenta = purple;
+        c.terminal_ansi_cyan = accent_alt;
+        c.terminal_ansi_white = fg;
+        c.terminal_ansi_bright_black = fg_subtle;
+        c.terminal_ansi_bright_red = red;
+        c.terminal_ansi_bright_green = green;
+        c.terminal_ansi_bright_yellow = yellow_bright;
+        c.terminal_ansi_bright_blue = accent_alt;
+        c.terminal_ansi_bright_magenta = purple;
+        c.terminal_ansi_bright_cyan = accent_alt;
+        c.terminal_ansi_bright_white = fg;
+    }
+
+    let theme = Theme {
+        id: "slop-embed".to_string(),
+        name: "Slop".into(),
+        appearance: base.appearance,
+        styles,
+    };
+    GlobalTheme::update_theme(cx, std::sync::Arc::new(theme));
+    cx.refresh_windows();
+}
+
+/// In embed mode one process serves many host windows. Instead of opening a
+/// workspace at boot, poll the embed connection counter and open a fresh window
+/// per host connection (the platform layer binds each to its queued socket).
+fn init_embed_windows(app_state: Arc<AppState>, cx: &mut gpui::App) {
+    cx.spawn(async move |cx| {
+        let mut opened = 0u64;
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            let count = gpui::embed_palette::embed_connection_count();
+            while opened < count {
+                opened += 1;
+                // Path + stream are index-correlated across their queues, so
+                // open one connection fully (awaiting, which pops its stream via
+                // `open_window`) before advancing to the next.
+                let path = gpui::embed_palette::take_embed_path().unwrap_or_default();
+                let app_state = app_state.clone();
+                let options = workspace::OpenOptions {
+                    // Always a fresh window per connection.
+                    workspace_matching: workspace::WorkspaceMatching::None,
+                    ..Default::default()
+                };
+                if path.is_empty() {
+                    let task = cx.update(|cx| {
+                        workspace::open_new(options, app_state, cx, |_, _, _| {})
+                    });
+                    let _ = task.await;
+                } else {
+                    let task = cx.update(|cx| {
+                        workspace::open_paths(
+                            &[std::path::PathBuf::from(path)],
+                            app_state,
+                            options,
+                            cx,
+                        )
+                    });
+                    let _ = task.await;
+                }
+            }
+        }
+    })
+    .detach();
+}
+
 fn main() {
     STARTUP_TIME.get_or_init(|| Instant::now());
 
@@ -495,6 +663,9 @@ fn main() {
         }
         settings::init(cx);
         zlog_settings::init(cx);
+        // When embedded in a host (slop2), theme the editor from the host's
+        // palette, streamed in over the embed socket.
+        init_embed_theme(cx);
         zed::watch_settings_files(fs.clone(), cx);
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
 
@@ -919,47 +1090,53 @@ fn main() {
             )
         };
 
-        let restore_task = match open_rx
-            .try_recv()
-            .ok()
-            .and_then(|request| OpenRequest::parse(request, cx).log_err())
-        {
-            Some(request) if request.is_focus_app_only() => cx.spawn({
-                let app_state = app_state.clone();
-                async move |cx| {
-                    if let Err(e) = restore_or_create_workspace(app_state, cx).await {
-                        fail_to_open_window_async(e, cx)
+        // Embed mode: don't open a workspace at boot — open one per host
+        // connection instead (see `init_embed_windows`).
+        if std::env::var_os("ZED_EMBED_SOCKET").is_some() {
+            init_embed_windows(app_state.clone(), cx);
+        } else {
+            let restore_task = match open_rx
+                .try_recv()
+                .ok()
+                .and_then(|request| OpenRequest::parse(request, cx).log_err())
+            {
+                Some(request) if request.is_focus_app_only() => cx.spawn({
+                    let app_state = app_state.clone();
+                    async move |cx| {
+                        if let Err(e) = restore_or_create_workspace(app_state, cx).await {
+                            fail_to_open_window_async(e, cx)
+                        }
                     }
+                }),
+                Some(request) => {
+                    handle_open_request(request, app_state.clone(), cx);
+                    Task::ready(())
                 }
-            }),
-            Some(request) => {
-                handle_open_request(request, app_state.clone(), cx);
-                Task::ready(())
-            }
-            None => cx.spawn({
-                let app_state = app_state.clone();
-                async move |cx| {
-                    if let Err(e) = restore_or_create_workspace(app_state, cx).await {
-                        fail_to_open_window_async(e, cx)
+                None => cx.spawn({
+                    let app_state = app_state.clone();
+                    async move |cx| {
+                        if let Err(e) = restore_or_create_workspace(app_state, cx).await {
+                            fail_to_open_window_async(e, cx)
+                        }
                     }
-                }
-            }),
-        };
+                }),
+            };
 
-        cx.spawn({
-            let db = workspace::WorkspaceDb::global(cx);
-            let fs = app_state.fs.clone();
-            async move |_cx| {
-                restore_task.await;
-                db.garbage_collect_workspaces(
-                    fs.as_ref(),
-                    &current_session_id,
-                    last_session_id.as_deref(),
-                )
-                .await
-            }
-        })
-        .detach_and_log_err(cx);
+            cx.spawn({
+                let db = workspace::WorkspaceDb::global(cx);
+                let fs = app_state.fs.clone();
+                async move |_cx| {
+                    restore_task.await;
+                    db.garbage_collect_workspaces(
+                        fs.as_ref(),
+                        &current_session_id,
+                        last_session_id.as_deref(),
+                    )
+                    .await
+                }
+            })
+            .detach_and_log_err(cx);
+        }
 
         let app_state = app_state.clone();
 

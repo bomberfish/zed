@@ -43,6 +43,7 @@ members = [
     "crates/copilot",
     "crates/copilot_chat",
     "crates/crashes",
+    "crates/dmabuf_poc",
     "crates/credentials_provider",
     "crates/csv_preview",
     "crates/dap",

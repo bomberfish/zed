@@ -18,6 +18,8 @@ mod bounds_tree;
 mod color;
 /// The default colors used by GPUI.
 pub mod colors;
+/// Host-palette bridge for headless embedding.
+pub mod embed_palette;
 mod element;
 mod elements;
 mod executor;

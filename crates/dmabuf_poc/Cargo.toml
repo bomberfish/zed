@@ -1,0 +1,20 @@
+[package]
+name = "dmabuf_poc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "dmabuf_poc"
+path = "src/main.rs"
+
+[dependencies]
+# Match Zed's workspace versions so this reuses the built dependency cache.
+wgpu.workspace = true
+pollster.workspace = true
+anyhow.workspace = true
+# dma-buf export: `ash` resolves to the same 0.38 that wgpu-hal uses, so the
+# `vk::*` handle types unify across the `wgpu::hal` boundary.
+ash = "0.38"
+nix = { workspace = true, features = ["socket", "uio"] }
+libc = "0.2"

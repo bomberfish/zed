@@ -41,6 +41,63 @@ impl WgpuContext {
         Self::new_with_options(instance, surface, compositor_gpu, true)
     }
 
+    /// Build a GPU context with no surface, for offscreen (headless) rendering
+    /// into a texture. Mirrors `new_web`'s surfaceless path: pick an adapter
+    /// with `compatible_surface: None` and create the device directly.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_offscreen(instance: wgpu::Instance, dmabuf: bool) -> anyhow::Result<Self> {
+        let (adapter, device, queue, dual_source_blending, color_texture_format) =
+            gpui::block_on(async {
+                let adapter = instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: None,
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to request GPU adapter: {e}"))?;
+                // dma-buf export needs a device opened with Vulkan external-memory
+                // extensions; otherwise the plain surfaceless device is fine.
+                let (device, queue, dual_source_blending, color_texture_format) = if dmabuf {
+                    let (device, queue) = crate::dmabuf::create_device(&adapter)?;
+                    let color = Self::select_color_texture_format(&adapter)?;
+                    // The dma-buf device is opened with no extra wgpu features,
+                    // so dual-source blending is off (grayscale text AA only).
+                    (device, queue, false, color)
+                } else {
+                    Self::create_device(&adapter).await?
+                };
+                anyhow::Ok((adapter, device, queue, dual_source_blending, color_texture_format))
+            })?;
+
+        let device_lost = Arc::new(AtomicBool::new(false));
+        device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+
+        log::info!(
+            "Selected offscreen GPU adapter: {:?} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
+
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            dual_source_blending,
+            color_texture_format,
+            device_lost,
+        })
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn new_with_options(
         instance: wgpu::Instance,
