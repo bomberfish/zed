@@ -30,7 +30,8 @@ use project::{
 use language::{LanguageName, Toolchain, ToolchainScope};
 use remote::{
     DockerConnectionOptions, RemoteConnectionIdentity, RemoteConnectionOptions,
-    SshConnectionOptions, WslConnectionOptions, remote_connection_identity,
+    Slop2ConnectionOptions, SshConnectionOptions, WslConnectionOptions,
+    remote_connection_identity,
 };
 use serde::{Deserialize, Serialize};
 use sqlez::{
@@ -1698,6 +1699,18 @@ impl WorkspaceDb {
                 name = Some(identity_name);
                 user = Some(remote_user);
             }
+            RemoteConnectionIdentity::Slop2 {
+                name: identity_name,
+                target,
+            } => {
+                kind = RemoteConnectionKind::Slop2;
+                name = Some(identity_name);
+                // The target is `host:port`, a socket path, or "local"; it goes in
+                // the host column so the identity round-trips through the columns
+                // this table already has.
+                host = Some(target);
+                user = None;
+            }
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionIdentity::Mock { id } => {
                 kind = RemoteConnectionKind::Ssh;
@@ -1977,6 +1990,29 @@ impl WorkspaceDb {
                 username: user,
                 ..Default::default()
             })),
+            RemoteConnectionKind::Slop2 => {
+                let target = host?;
+                // Split the stored target back into the shape the transport
+                // wants: `host:port`, a socket path, or the local daemon.
+                let (slop_host, slop_port, socket) = if target == "local" {
+                    (None, None, None)
+                } else if target.starts_with('/') {
+                    (None, None, Some(target))
+                } else {
+                    match target.rsplit_once(':') {
+                        Some((host, port)) => {
+                            (Some(host.to_string()), port.parse().ok(), None)
+                        }
+                        None => (Some(target), None, None),
+                    }
+                };
+                Some(RemoteConnectionOptions::Slop2(Slop2ConnectionOptions {
+                    name: name.unwrap_or_default(),
+                    host: slop_host,
+                    port: slop_port,
+                    socket,
+                }))
+            }
             RemoteConnectionKind::Docker => {
                 let remote_env: BTreeMap<String, String> =
                     serde_json::from_str(&remote_env?).ok()?;
@@ -5951,4 +5987,48 @@ mod tests {
             );
         });
     }
+    #[gpui::test]
+    async fn test_slop2_remote_connection_round_trips() {
+        let db = WorkspaceDb::open_test_db("test_slop2_remote_connection_round_trips").await;
+
+        // Each shape of target has to survive the trip through the columns this
+        // table already has (there is no slop2-specific column): a tailnet
+        // host:port, an explicit socket path, and the local daemon.
+        for options in [
+            Slop2ConnectionOptions {
+                name: "desktop".into(),
+                host: Some("100.64.0.24".into()),
+                port: Some(7767),
+                socket: None,
+            },
+            Slop2ConnectionOptions {
+                name: "local-socket".into(),
+                host: None,
+                port: None,
+                socket: Some("/run/user/1000/slop2/daemon.sock".into()),
+            },
+            Slop2ConnectionOptions {
+                name: "local".into(),
+                host: None,
+                port: None,
+                socket: None,
+            },
+        ] {
+            let stored = RemoteConnectionOptions::Slop2(options.clone());
+            let id = db
+                .get_or_create_remote_connection(stored.clone())
+                .await
+                .unwrap();
+            let loaded = db.remote_connection(id).unwrap();
+            assert_eq!(loaded, stored, "round trip for {options:?}");
+
+            // Same options must map to the same row rather than piling up.
+            let again = db
+                .get_or_create_remote_connection(stored.clone())
+                .await
+                .unwrap();
+            assert_eq!(again, id, "identity must be stable for {options:?}");
+        }
+    }
+
 }

@@ -171,6 +171,10 @@ impl From<RemoteConnectionOptions> for RemoteHostLocation {
                 Some(SharedString::new(docker_connection_options.name)),
                 SharedString::new(docker_connection_options.container_id),
             ),
+            RemoteConnectionOptions::Slop2(slop2) => (
+                None,
+                SharedString::new(slop2.display_name()),
+            ),
             #[cfg(feature = "test-support")]
             RemoteConnectionOptions::Mock(mock) => {
                 (None, SharedString::new(format!("mock-{}", mock.id)))

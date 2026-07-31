@@ -46,7 +46,19 @@ fn main() -> anyhow::Result<()> {
         if let Err(e) = &res
             && let Some(e) = e.downcast_ref::<ExecuteProxyError>()
         {
-            std::io::stderr().write_fmt(format_args!("{e:#}\n")).ok();
+            // `{:#}` is anyhow's chaining formatter, not thiserror's: on an
+            // ExecuteProxyError it prints the top message alone, so
+            // `SpawnServer(#[source] …)` reached the client as a bare "failed to
+            // spawn server" with the actual reason (couldn't exec, timed out
+            // waiting for the sockets, …) dropped. Walk the chain ourselves.
+            let mut message = format!("{e}");
+            let mut cause: Option<&(dyn std::error::Error + 'static)> =
+                std::error::Error::source(e);
+            while let Some(source) = cause {
+                message.push_str(&format!(": {source}"));
+                cause = source.source();
+            }
+            std::io::stderr().write_fmt(format_args!("{message}\n")).ok();
             // It is important for us to report the proxy spawn exit code here
             // instead of the generic 1 that result returns
             // The client reads the exit code to determine if the server process has died when trying to reconnect

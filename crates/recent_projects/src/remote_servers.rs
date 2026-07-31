@@ -413,6 +413,10 @@ impl ProjectPicker {
                 connection_string: "".into(),
                 nickname: None,
             },
+            RemoteConnectionOptions::Slop2(connection) => ProjectPickerData::Ssh {
+                connection_string: connection.display_name().into(),
+                nickname: None,
+            },
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(options) => ProjectPickerData::Ssh {
                 connection_string: format!("mock-{}", options.id).into(),

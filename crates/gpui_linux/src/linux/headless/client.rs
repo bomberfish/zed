@@ -1,24 +1,36 @@
+// The embed path (offscreen render + IPC) needs a GPU stack, so it is behind
+// `gpui_wgpu` — see `open_window`. Its imports are gated with it, since a
+// headless build (`remote_server`) compiles the path out entirely.
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{IoSlice, Read, Write};
+#[cfg(feature = "gpui_wgpu")]
+use std::io::IoSlice;
+use std::io::{Read, Write};
+#[cfg(feature = "gpui_wgpu")]
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::OnceLock;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "gpui_wgpu")]
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use calloop::{EventLoop, LoopHandle};
 use gpui_util::ResultExt;
+#[cfg(feature = "gpui_wgpu")]
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 
 use crate::linux::headless::window::{HeadlessDisplay, HeadlessWindow};
 use crate::linux::{LinuxClient, LinuxCommon, LinuxKeyboardLayout};
+#[cfg(feature = "gpui_wgpu")]
 use gpui::{
-    AnyWindowHandle, CursorStyle, DisplayId, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformDisplay,
-    PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent,
-    TouchPhase, WindowParams, point, px,
+    KeyDownEvent, KeyUpEvent, Keystroke, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px,
+};
+use gpui::{
+    AnyWindowHandle, CursorStyle, DisplayId, Modifiers, MouseButton, NavigationDirection,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformWindow, WindowParams,
 };
 
 // Modifier bitfield shared with slop2's `EmbedSurface` encoder.
@@ -165,6 +177,10 @@ fn write_embed_frame(
 
 // dma-buf handshake (once): plane geometry + the DRM PRIME fds via SCM_RIGHTS.
 //   b"DMAB" + num_fds u32 + width + height + stride + offset + modifier(u64) + fourcc
+//
+// Behind `gpui_wgpu` with the rest of the embed path: `DmabufInfo` comes from the
+// renderer crate, which a headless build (`remote_server`) does not link.
+#[cfg(feature = "gpui_wgpu")]
 fn send_handshake(
     socket_fd: RawFd,
     info: &gpui_wgpu::DmabufInfo,
@@ -256,13 +272,12 @@ fn cursor_name(style: CursorStyle) -> &'static str {
     }
 }
 
-// The writer for the window that should receive cursor updates. `set_cursor_style`
-// is client-global (no window arg), so we target the most recently bound embed
-// window — correct for the common single-window case.
-static CURSOR_WRITER: Mutex<Option<UnixStream>> = Mutex::new(Option::None);
-// Last cursor name sent, so we don't emit a CURS message every paint (GPUI
-// re-applies the cursor style on each frame while the window is hovered).
-static LAST_CURSOR: Mutex<Option<&'static str>> = Mutex::new(Option::None);
+// Cursor requested by the most recent `set_cursor_style` call. GPUI sets the
+// cursor several times per paint (a default reset, then the hovered element's
+// real cursor), so we don't forward each call — we stash the latest here and
+// flush only the final value once per frame (see the frame clock), else the
+// consumer flickers between the reset default and the real cursor every frame.
+static PENDING_CURSOR: Mutex<Option<&'static str>> = Mutex::new(Option::None);
 // System clipboard bridged from the host. The headless process has no display
 // server, so `read_from_clipboard` returns this cached text (kept fresh by the
 // host pushing `Clipboard` updates), and `write_to_clipboard` sends the text
@@ -271,9 +286,13 @@ static CLIPBOARD_CACHE: Mutex<Option<String>> = Mutex::new(Option::None);
 static CLIPBOARD_WRITER: Mutex<Option<UnixStream>> = Mutex::new(Option::None);
 
 fn mouse_button(button: u8) -> MouseButton {
+    // Button numbers are GTK/GDK's: 1 left, 2 middle, 3 right, 8 back, 9
+    // forward (the X11/evdev convention GDK exposes for the side buttons).
     match button {
         3 => MouseButton::Right,
         2 => MouseButton::Middle,
+        8 => MouseButton::Navigate(NavigationDirection::Back),
+        9 => MouseButton::Navigate(NavigationDirection::Forward),
         _ => MouseButton::Left,
     }
 }
@@ -293,21 +312,32 @@ static EMBED_ENQUEUE: Mutex<()> = Mutex::new(());
 
 // First message on a new connection: the host's project dir. b"CWD " + u32 len
 // + path bytes. Read before the window opens so it opens the right directory.
+/// Read an embed connection's opening message: `CWD ` + u32 len + path.
+///
+/// `None` means the peer hung up without saying anything — the host polls this
+/// socket to learn when we are accepting, and that liveness probe must not turn
+/// into a window nobody asked for (it would also steal the next real consumer's
+/// queue slot). Anything else is a consumer, with an empty path meaning "no
+/// project named".
 fn read_embed_cwd(stream: &mut UnixStream) -> Option<String> {
     let mut magic = [0u8; 4];
     stream.read_exact(&mut magic).ok()?;
     if &magic != b"CWD " {
-        return None;
+        return Some(String::new());
     }
     let mut len = [0u8; 4];
-    stream.read_exact(&mut len).ok()?;
+    if stream.read_exact(&mut len).is_err() {
+        return Some(String::new());
+    }
     let n = u32::from_le_bytes(len) as usize;
     if n > 4096 {
-        return None;
+        return Some(String::new());
     }
     let mut buf = vec![0u8; n];
-    stream.read_exact(&mut buf).ok()?;
-    String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+    if stream.read_exact(&mut buf).is_err() {
+        return Some(String::new());
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Start the embed accept loop once. Each accepted connection is queued and the
@@ -334,7 +364,9 @@ fn ensure_embed_listener(socket_path: &str) {
                     // thread so a slow/absent cwd never stalls other accepts,
                     // then enqueue path + stream + counter atomically.
                     std::thread::spawn(move || {
-                        let path = read_embed_cwd(&mut stream).unwrap_or_default();
+                        let Some(path) = read_embed_cwd(&mut stream) else {
+                            return;
+                        };
                         let _guard = EMBED_ENQUEUE.lock();
                         gpui::embed_palette::push_embed_path(path);
                         if let Ok(mut queue) = PENDING_CONNECTIONS.lock() {
@@ -466,6 +498,13 @@ impl LinuxClient for HeadlessClient {
 
         // Embed mode: render offscreen and bridge frames/input over a unix
         // socket (the consumer, e.g. slop2, connects to it).
+        //
+        // Requires a GPU stack. `remote_server` links this crate with neither
+        // `wayland` nor `x11` — the two features that bring in `gpui_wgpu` — and a
+        // headless project host renders nothing, so the whole path compiles out
+        // there and `open_window` falls through to the discard-everything window
+        // below.
+        #[cfg(feature = "gpui_wgpu")]
         if let Ok(socket_path) = std::env::var("ZED_EMBED_SOCKET") {
             // Opt into zero-copy dma-buf transport (needs Vulkan external-memory
             // support). Otherwise fall back to CPU readback frames.
@@ -493,12 +532,8 @@ impl LinuxClient for HeadlessClient {
                 mode_writer.write_all(&[dmabuf as u8]).ok();
             }
 
-            // Route cursor-style changes to this window's consumer.
-            if let Ok(cursor_clone) = stream.try_clone()
-                && let Ok(mut guard) = CURSOR_WRITER.lock()
-            {
-                *guard = Some(cursor_clone);
-            }
+            // Cursor changes are routed per-window from the frame clock below
+            // (using this window's own writer), not through a global.
             // Route clipboard writes (copy in the embed) to this consumer.
             if let Ok(clip_clone) = stream.try_clone()
                 && let Ok(mut guard) = CLIPBOARD_WRITER.lock()
@@ -571,6 +606,16 @@ impl LinuxClient for HeadlessClient {
             // we shut down to signal that.
             let win_weak = window.downgrade();
             let mut close_stream = stream.try_clone()?;
+            // Per-window cursor routing: this window's own writer + last-sent
+            // cursor. `set_cursor_style` is client-global (no window arg), but the
+            // frame clocks run sequentially on the one event-loop thread, so the
+            // cursor GPUI sets during *this* window's tick belongs to it. We clear
+            // the shared PENDING_CURSOR at the top of the tick and flush whatever
+            // this tick produced to this window's consumer — so multiple embed
+            // windows each get their own cursor instead of all funneling to the
+            // last-opened one.
+            let mut cursor_writer = stream.try_clone()?;
+            let mut last_cursor: Option<&'static str> = None;
             let mut last_pos: Point<Pixels> = point(px(0.0), px(0.0));
             // Track the currently-held button so drags carry it on MouseMove
             // (GPUI needs `pressed_button` set for drag gestures to work).
@@ -595,6 +640,11 @@ impl LinuxClient for HeadlessClient {
                             let _ = close_stream.shutdown(std::net::Shutdown::Both);
                             return calloop::timer::TimeoutAction::Drop;
                         };
+                        // Clear the shared cursor slot so this tick captures only
+                        // the cursor GPUI sets for *this* window's paint/input.
+                        if let Ok(mut pending) = PENDING_CURSOR.lock() {
+                            *pending = None;
+                        }
                         // Mark active once GPUI has registered its callbacks, so
                         // the editor accepts typed text (not just keybindings).
                         win.ensure_active();
@@ -707,6 +757,17 @@ impl LinuxClient for HeadlessClient {
                             }
                         }
                         win.tick_frame();
+                        // Forward this window's final cursor (if it changed) to
+                        // its own consumer — one CURS per frame, after the paint's
+                        // set_cursor_style calls have settled.
+                        if let Ok(pending) = PENDING_CURSOR.lock() {
+                            if let Some(name) = *pending {
+                                if last_cursor != Some(name) {
+                                    last_cursor = Some(name);
+                                    let _ = write_cursor(&mut cursor_writer, name);
+                                }
+                            }
+                        }
                         calloop::timer::TimeoutAction::ToDuration(Duration::from_millis(16))
                     },
                 )
@@ -723,18 +784,11 @@ impl LinuxClient for HeadlessClient {
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
-        let name = cursor_name(style);
-        // Skip unchanged cursors (GPUI re-applies every paint).
-        if let Ok(mut last) = LAST_CURSOR.lock() {
-            if *last == Some(name) {
-                return;
-            }
-            *last = Some(name);
-        }
-        if let Ok(mut guard) = CURSOR_WRITER.lock()
-            && let Some(writer) = guard.as_mut()
-        {
-            let _ = write_cursor(writer, name);
+        // Just record the latest request; the frame clock forwards the final
+        // value once per frame (coalescing the per-paint default-then-real
+        // sequence into one, so the consumer doesn't flicker).
+        if let Ok(mut pending) = PENDING_CURSOR.lock() {
+            *pending = Some(cursor_name(style));
         }
     }
 
@@ -781,5 +835,45 @@ impl LinuxClient for HeadlessClient {
             .expect("App is already running");
 
         event_loop.run(None, &mut self.clone(), |_| {}).log_err();
+    }
+}
+
+#[cfg(all(test, feature = "gpui_wgpu"))]
+mod tests {
+    use super::*;
+
+    /// The host polls the embed socket to learn when we accept connections. That
+    /// probe used to be indistinguishable from a consumer, so it opened a window
+    /// and took the next real consumer's queue slot — which broke every embed
+    /// that needed its window to be created for a specific project.
+    #[test]
+    fn a_probe_is_not_a_consumer_but_a_pathless_client_is() {
+        let (host, mut zed) = UnixStream::pair().expect("socketpair");
+        drop(host);
+        assert_eq!(
+            read_embed_cwd(&mut zed),
+            None,
+            "connect-and-hang-up is a probe"
+        );
+
+        let (mut host, mut zed) = UnixStream::pair().expect("socketpair");
+        host.write_all(b"CWD ").unwrap();
+        host.write_all(&12u32.to_le_bytes()).unwrap();
+        host.write_all(b"/home/velzie").unwrap();
+        assert_eq!(read_embed_cwd(&mut zed).as_deref(), Some("/home/velzie"));
+
+        // A consumer that names no project still gets its window.
+        let (mut host, mut zed) = UnixStream::pair().expect("socketpair");
+        host.write_all(b"CWD ").unwrap();
+        host.write_all(&0u32.to_le_bytes()).unwrap();
+        drop(host);
+        assert_eq!(read_embed_cwd(&mut zed).as_deref(), Some(""));
+
+        // So does one whose opening message we don't recognise, since it did
+        // speak: dropping it would strand a peer that got here somehow.
+        let (mut host, mut zed) = UnixStream::pair().expect("socketpair");
+        host.write_all(b"RFB \x00").unwrap();
+        drop(host);
+        assert_eq!(read_embed_cwd(&mut zed).as_deref(), Some(""));
     }
 }

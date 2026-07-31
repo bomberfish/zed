@@ -762,6 +762,12 @@ pub enum ServerPathError {
 #[derive(Clone, Debug)]
 struct ServerPaths {
     log_file: PathBuf,
+    /// Where the server child's raw stderr goes. Distinct from `log_file`, which
+    /// the child opens ITSELF: anything that kills it before that — a dynamic
+    /// linker error, a panic in early init, an unwritable path — used to go to
+    /// /dev/null, leaving "failed to spawn server" with an empty log directory and
+    /// no trace anywhere on either machine.
+    stderr_log: PathBuf,
     pid_file: PathBuf,
     stdin_socket: PathBuf,
     stdout_socket: PathBuf,
@@ -788,9 +794,11 @@ impl ServerPaths {
         let stdout_socket = server_dir.join("stdout.sock");
         let stderr_socket = server_dir.join("stderr.sock");
         let log_file = logs_dir().join(format!("server-{}.log", identifier));
+        let stderr_log = logs_dir().join(format!("server-{}.stderr.log", identifier));
 
         Ok(Self {
             pid_file,
+            stderr_log,
             stdin_socket,
             stdout_socket,
             stderr_socket,
@@ -1030,8 +1038,11 @@ pub enum SpawnServerError {
     #[error("failed to launch server process")]
     ProcessStatus(#[source] std::io::Error),
 
-    #[error("failed to wait for server to be ready to accept connections")]
-    Timeout,
+    // Naming the sockets matters: the usual cause is that they cannot be BOUND at
+    // all — `sockaddr_un.sun_path` is 108 bytes, so a deep data dir fails here and
+    // nowhere else — and "timed out" alone sends you looking at the wrong thing.
+    #[error("timed out waiting for the server to bind {0}")]
+    Timeout(String),
 }
 
 async fn spawn_server(paths: &ServerPaths) -> Result<(), SpawnServerError> {
@@ -1068,7 +1079,28 @@ async fn spawn_server(paths: &ServerPaths) -> Result<(), SpawnServerError> {
         std::thread::sleep(wait_duration);
         total_time_waited += wait_duration;
         if total_time_waited > std::time::Duration::from_secs(10) {
-            return Err(SpawnServerError::Timeout);
+            let missing = [
+                &paths.stdin_socket,
+                &paths.stdout_socket,
+                &paths.stderr_socket,
+            ]
+            .iter()
+            .filter(|path| !path.exists())
+            .map(|path| {
+                let path = path.display().to_string();
+                let len = path.len();
+                if len >= 100 {
+                    format!("{path} ({len} bytes, over the 108-byte unix socket limit)")
+                } else {
+                    path
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+            return Err(SpawnServerError::Timeout(format!(
+                "{missing} (the child's stderr is in {})",
+                paths.stderr_log.display()
+            )));
         }
     }
 
@@ -1106,10 +1138,14 @@ fn spawn_server_windows(binary_name: &Path, paths: &ServerPaths) -> Result<(), S
 #[cfg(not(windows))]
 fn spawn_server_normal(binary_name: &Path, paths: &ServerPaths) -> Result<(), SpawnServerError> {
     let mut server_process = new_command(binary_name);
+    // Keep the child's stderr instead of discarding it: it is the only witness to
+    // a failure that happens before the child opens its own log.
+    let stderr = std::fs::File::create(&paths.stderr_log)
+        .map_err(SpawnServerError::ProcessStatus)?;
     server_process
         .stdin(util::command::Stdio::null())
         .stdout(util::command::Stdio::null())
-        .stderr(util::command::Stdio::null())
+        .stderr(util::command::Stdio::from(stderr))
         .arg("run")
         .arg("--log-file")
         .arg(&paths.log_file)

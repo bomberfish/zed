@@ -31,7 +31,9 @@ use gpui::{
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use gpui::{Pixels, Point, px};
 
-#[cfg(any(feature = "wayland", feature = "x11"))]
+// Not gated on wayland/x11: the headless platform's embed input path converts
+// wheel notches with it too, and that platform is compiled in EVERY
+// configuration (it is what `remote_server` links).
 pub(crate) const SCROLL_LINES: f32 = 3.0;
 
 // Values match the defaults on GTK.

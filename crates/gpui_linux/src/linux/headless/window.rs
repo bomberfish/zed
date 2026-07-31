@@ -58,7 +58,7 @@ struct HeadlessWindowState {
     is_fullscreen: bool,
     // Embed mode (`ZED_EMBED_SOCKET`): render offscreen via wgpu and drive
     // frames/input over IPC instead of discarding everything.
-    renderer: Option<gpui_wgpu::WgpuRenderer>,
+    renderer: Option<EmbedRenderer>,
     request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     input: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     resize: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
@@ -109,6 +109,38 @@ impl raw_window_handle::HasDisplayHandle for HeadlessWindow {
     }
 }
 
+/// The offscreen renderer the embed path drives.
+///
+/// `remote_server` links this crate with neither `wayland` nor `x11`, and both of
+/// those are what pull in `gpui_wgpu` — a headless project host has no GPU stack
+/// and no business rendering. The headless platform, however, is compiled in
+/// EVERY configuration, so the embed code has to survive that build. It does by
+/// swapping the renderer for an uninhabited stand-in: `renderer` is then provably
+/// always `None`, the embed entry points are compiled out, and the few remaining
+/// call sites keep their exact shape.
+#[cfg(feature = "gpui_wgpu")]
+pub(crate) type EmbedRenderer = gpui_wgpu::WgpuRenderer;
+
+#[cfg(not(feature = "gpui_wgpu"))]
+pub(crate) enum EmbedRenderer {}
+
+#[cfg(not(feature = "gpui_wgpu"))]
+impl EmbedRenderer {
+    // Bodies are `match *self {}`: the type has no values, so these are
+    // unreachable by construction and need no fallback behaviour.
+    pub(crate) fn resize_offscreen(&mut self, _width: u32, _height: u32) {
+        match *self {}
+    }
+
+    pub(crate) fn draw_offscreen(&mut self, _scene: &Scene) {
+        match *self {}
+    }
+
+    pub(crate) fn sprite_atlas(&self) -> &Arc<dyn PlatformAtlas> {
+        match *self {}
+    }
+}
+
 impl HeadlessWindow {
     pub(crate) fn new(params: WindowParams, display: Rc<dyn PlatformDisplay>) -> Self {
         Self(Rc::new(RefCell::new(HeadlessWindowState {
@@ -131,10 +163,11 @@ impl HeadlessWindow {
 
     /// Embed-mode window: owns an offscreen wgpu renderer (already wired with an
     /// `on_frame` callback that ships pixels over IPC).
+    #[cfg(feature = "gpui_wgpu")]
     pub(crate) fn new_embed(
         params: WindowParams,
         display: Rc<dyn PlatformDisplay>,
-        renderer: gpui_wgpu::WgpuRenderer,
+        renderer: EmbedRenderer,
     ) -> Self {
         Self(Rc::new(RefCell::new(HeadlessWindowState {
             bounds: params.bounds,
@@ -194,6 +227,7 @@ impl HeadlessWindow {
 
     /// Enable zero-copy dma-buf export on the embed renderer, returning the
     /// plane geometry + fds to hand to the consumer.
+    #[cfg(feature = "gpui_wgpu")]
     pub(crate) fn enable_dmabuf(
         &self,
         width: u32,
@@ -213,6 +247,7 @@ impl HeadlessWindow {
 
     /// Register the per-frame dma-buf ready callback on the embed renderer
     /// (target index + active width/height).
+    #[cfg(feature = "gpui_wgpu")]
     pub(crate) fn set_on_dmabuf(&self, callback: Box<dyn FnMut(usize, u32, u32)>) {
         if let Some(renderer) = self.0.borrow_mut().renderer.as_mut() {
             renderer.set_on_dmabuf(callback);

@@ -18,7 +18,7 @@ use gpui::{App, AsyncApp, Global, TaskExt, WindowHandle};
 use onboarding::FIRST_OPEN;
 use onboarding::show_onboarding_view;
 use recent_projects::{RemoteSettings, navigate_to_positions, open_remote_project};
-use remote::{RemoteConnectionOptions, WslConnectionOptions};
+use remote::{RemoteConnectionOptions, Slop2ConnectionOptions, WslConnectionOptions};
 use settings::Settings;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,6 +121,35 @@ impl std::fmt::Debug for OpenRequestKind {
     }
 }
 
+/// Split `slop2://[name@]host[:port]/path` — or `slop2:///path` for the local
+/// daemon — into the connection to make and the path to open on it. slop2 spawns
+/// this Zed itself and supplies the URL, so the host part is whatever it already
+/// uses to reach that daemon: a tailnet address, or nothing at all when the
+/// project lives on this machine.
+pub fn parse_slop2_url(file: &str) -> Result<(RemoteConnectionOptions, String)> {
+    let url = url::Url::parse(file)?;
+    let host = url.host().map(|host| match host {
+        url::Host::Domain(host) => host.to_string(),
+        url::Host::Ipv4(host) => host.to_string(),
+        url::Host::Ipv6(host) => host.to_string(),
+    });
+    let name = if url.username().is_empty() {
+        host.clone().unwrap_or_else(|| "local".to_string())
+    } else {
+        urlencoding::decode(url.username())?.into_owned()
+    };
+    let connection_options = RemoteConnectionOptions::Slop2(Slop2ConnectionOptions {
+        name,
+        host,
+        port: url.port(),
+        // The daemon's socket path can't travel in a URL authority; an explicit
+        // one is only needed for a non-default local daemon, and slop2 passes
+        // that through $SLOP_DAEMON_SOCKET to the bridge.
+        socket: None,
+    });
+    Ok((connection_options, url.path().to_string()))
+}
+
 impl OpenRequest {
     pub fn is_focus_app_only(&self) -> bool {
         matches!(self.kind, Some(OpenRequestKind::FocusApp))
@@ -193,6 +222,8 @@ impl OpenRequest {
                 this.parse_git_commit_url(commit_path)?
             } else if url.starts_with("ssh://") {
                 this.parse_ssh_file_path(&url, cx)?
+            } else if url.starts_with("slop2://") {
+                this.parse_slop2_file_path(&url)?
             } else if let Some(zed_link) = parse_zed_link(&url, cx) {
                 match zed_link {
                     ZedLink::Channel { channel_id } => {
@@ -278,6 +309,23 @@ impl OpenRequest {
             sha: sha.to_string(),
         });
 
+        Ok(())
+    }
+
+    fn parse_slop2_file_path(&mut self, file: &str) -> Result<()> {
+        let (connection_options, path) = parse_slop2_url(file)?;
+        anyhow::ensure!(
+            self.open_paths.is_empty(),
+            "cannot open both local and slop2 paths"
+        );
+        if let Some(existing) = &self.remote_connection {
+            anyhow::ensure!(
+                *existing == connection_options,
+                "cannot open multiple different remote connections"
+            );
+        }
+        self.remote_connection = Some(connection_options);
+        self.parse_file_path(&path);
         Ok(())
     }
 

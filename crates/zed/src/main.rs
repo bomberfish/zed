@@ -286,6 +286,18 @@ fn apply_embed_palette(cx: &mut gpui::App, palette: gpui::embed_palette::EmbedPa
         c.icon_accent = accent;
         c.editor_line_number = fg_subtle;
         c.editor_active_line_number = fg;
+        // Line + element highlight backgrounds. Translucent overlays (not solid
+        // palette colors) so a hovered/active line reads correctly over *any*
+        // surface — a solid bg_alt would vanish on panels already using bg_alt.
+        let overlay = |base: gpui::Hsla, a: f32| gpui::Hsla { a, ..base };
+        c.editor_active_line_background = overlay(fg, 0.06);
+        c.editor_highlighted_line_background = overlay(accent, 0.12);
+        c.element_hover = overlay(fg, 0.08);
+        c.ghost_element_hover = overlay(fg, 0.08);
+        c.element_active = overlay(fg, 0.12);
+        c.ghost_element_active = overlay(fg, 0.12);
+        c.element_selected = overlay(accent, 0.16);
+        c.ghost_element_selected = overlay(accent, 0.16);
         // Integrated terminal ANSI palette.
         c.terminal_background = bg;
         c.terminal_ansi_background = bg;
@@ -348,6 +360,24 @@ fn init_embed_windows(app_state: Arc<AppState>, cx: &mut gpui::App) {
                         workspace::open_new(options, app_state, cx, |_, _, _| {})
                     });
                     let _ = task.await;
+                } else if path.starts_with("slop2://") {
+                    // A remote project: the host asked for a machine + path
+                    // rather than a local directory. `open_remote_project` opens
+                    // exactly one window when nothing is requesting one, so that
+                    // window is the one this connection binds to.
+                    match zed::parse_slop2_url(&path) {
+                        Ok((connection_options, remote_path)) => {
+                            let paths = urlencoding::decode(&remote_path)
+                                .map(|path| vec![std::path::PathBuf::from(path.into_owned())])
+                                .unwrap_or_default();
+                            open_remote_project(connection_options, paths, app_state, options, cx)
+                                .await
+                                .log_err();
+                        }
+                        Err(error) => {
+                            log::error!("embed host asked for {path}: {error:#}");
+                        }
+                    }
                 } else {
                     let task = cx.update(|cx| {
                         workspace::open_paths(
@@ -1970,6 +2000,7 @@ fn parse_url_arg(arg: &str, cx: &App) -> String {
                 || arg.starts_with("zed://")
                 || arg.starts_with("zed-cli://")
                 || arg.starts_with("ssh://")
+                || arg.starts_with("slop2://")
                 || parse_zed_link(arg, cx).is_some()
             {
                 arg.into()

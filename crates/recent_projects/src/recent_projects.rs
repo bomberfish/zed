@@ -2001,6 +2001,7 @@ pub(crate) fn icon_for_remote_connection(options: Option<&RemoteConnectionOption
             RemoteConnectionOptions::Ssh(_) => IconName::Server,
             RemoteConnectionOptions::Wsl(_) => IconName::Linux,
             RemoteConnectionOptions::Docker(_) => IconName::Box,
+            RemoteConnectionOptions::Slop2(_) => IconName::Server,
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(_) => IconName::Server,
         },

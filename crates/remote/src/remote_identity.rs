@@ -22,6 +22,12 @@ pub enum RemoteConnectionIdentity {
         name: String,
         remote_user: String,
     },
+    /// A slop2 daemon: identified by where it is reached, not by its label, so
+    /// renaming a remote in slop2's config doesn't orphan its projects.
+    Slop2 {
+        name: String,
+        target: String,
+    },
     #[cfg(any(test, feature = "test-support"))]
     Mock { id: u64 },
 }
@@ -51,6 +57,7 @@ impl RemoteConnectionIdentity {
                 name,
                 remote_user,
             } => format!("docker:{remote_user}@{name}:{container_id}"),
+            Self::Slop2 { name, target } => format!("slop2:{name}@{target}"),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock { id } => format!("mock:{id}"),
         }
@@ -73,6 +80,16 @@ impl From<&RemoteConnectionOptions> for RemoteConnectionIdentity {
                 container_id: options.container_id.clone(),
                 name: options.name.clone(),
                 remote_user: options.remote_user.clone(),
+            },
+            RemoteConnectionOptions::Slop2(options) => Self::Slop2 {
+                name: options.name.clone(),
+                target: match (&options.host, options.port, &options.socket) {
+                    (Some(host), port, _) => {
+                        format!("{host}:{}", port.unwrap_or(7767))
+                    }
+                    (None, _, Some(socket)) => socket.clone(),
+                    (None, _, None) => "local".to_string(),
+                },
             },
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(options) => Self::Mock { id: options.id },

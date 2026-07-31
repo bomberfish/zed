@@ -159,8 +159,13 @@ pub trait RemoteClientDelegate: Send + Sync {
 const MAX_MISSED_HEARTBEATS: usize = 5;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+// The debug value is not just "the same thing, shorter": a debug-build
+// remote_server on a real remote has to spawn its `run` child, bind three unix
+// sockets and migrate its databases before it reports ready, and 5s did not
+// survive that over a network link — the connection failed with "client did not
+// become ready" while the server was still coming up perfectly well.
 const INITIAL_CONNECTION_TIMEOUT: Duration =
-    Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 60 });
+    Duration::from_secs(if cfg!(debug_assertions) { 30 } else { 60 });
 
 pub const MAX_RECONNECT_ATTEMPTS: usize = 3;
 
@@ -1271,6 +1276,11 @@ impl ConnectionPool {
                                 .await
                                 .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
                         }
+                        RemoteConnectionOptions::Slop2(opts) => {
+                            crate::transport::slop2::Slop2RemoteConnection::new(opts, delegate, cx)
+                                .await
+                                .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
+                        }
                         RemoteConnectionOptions::Docker(opts) => {
                             DockerExecConnection::new(opts, delegate, cx)
                                 .await
@@ -1323,6 +1333,9 @@ pub enum RemoteConnectionOptions {
     Ssh(SshConnectionOptions),
     Wsl(WslConnectionOptions),
     Docker(DockerConnectionOptions),
+    /// Remote editing through a slop2 daemon, which runs the remote server on
+    /// its own machine and tunnels it here (see `transport::slop2`).
+    Slop2(crate::transport::slop2::Slop2ConnectionOptions),
     #[cfg(any(test, feature = "test-support"))]
     Mock(crate::transport::mock::MockConnectionOptions),
 }
@@ -1342,6 +1355,7 @@ impl RemoteConnectionOptions {
                     opts.name.clone()
                 }
             }
+            RemoteConnectionOptions::Slop2(opts) => opts.display_name(),
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(opts) => format!("mock-{}", opts.id),
         }
@@ -1360,6 +1374,7 @@ impl RemoteConnectionOptions {
                     "docker"
                 }
             }
+            RemoteConnectionOptions::Slop2(_) => "slop2",
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(_) => "mock",
         }

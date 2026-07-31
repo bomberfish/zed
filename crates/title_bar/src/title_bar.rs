@@ -608,6 +608,7 @@ impl TitleBar {
             RemoteConnectionOptions::Docker(_dev_container_connection) => {
                 (None, "Dev Container", IconName::Box)
             }
+            RemoteConnectionOptions::Slop2(_) => (None, "slop2 Remote", IconName::Server),
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(_) => (None, "Mock Remote Project", IconName::Server),
         };

@@ -320,6 +320,9 @@ pub async fn open_remote_project(
                                 RemoteConnectionOptions::Docker(_) => {
                                     "Failed to connect to Dev Container"
                                 }
+                                RemoteConnectionOptions::Slop2(_) => {
+                                    "Failed to connect through slop2"
+                                }
                                 #[cfg(any(test, feature = "test-support"))]
                                 RemoteConnectionOptions::Mock(_) => {
                                     "Failed to connect to mock server"
@@ -380,6 +383,9 @@ pub async fn open_remote_project(
                                 RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
                                 RemoteConnectionOptions::Docker(_) => {
                                     "Failed to connect to Dev Container"
+                                }
+                                RemoteConnectionOptions::Slop2(_) => {
+                                    "Failed to connect through slop2"
                                 }
                                 #[cfg(any(test, feature = "test-support"))]
                                 RemoteConnectionOptions::Mock(_) => {
