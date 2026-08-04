@@ -5050,6 +5050,7 @@ impl Window {
         // keybindings work but typing does nothing.
         if cx.propagate_event
             && *IS_EMBEDDED_INPUT
+            && self.platform_window.commits_key_char()
             && let Some(key_down) = event.downcast_ref::<KeyDownEvent>()
             && let Some(input) = key_down.keystroke.key_char.clone()
             && let Some(mut input_handler) = self.platform_window.take_input_handler()

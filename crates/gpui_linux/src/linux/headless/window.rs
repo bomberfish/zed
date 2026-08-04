@@ -473,6 +473,11 @@ impl PlatformWindow for HeadlessWindow {
         Arc::new(HeadlessAtlas::default())
     }
 
+    /// No native window here, so nothing else will deliver typed characters.
+    fn commits_key_char(&self) -> bool {
+        true
+    }
+
     fn is_subpixel_rendering_supported(&self) -> bool {
         false
     }

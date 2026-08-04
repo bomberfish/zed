@@ -25,6 +25,13 @@ const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
 }
 
+pub type ExportInfo = DmabufInfo;
+pub type ExportTarget = DmabufTarget;
+
+/// A DRM PRIME fd. The Windows sibling of this module exports an NT handle
+/// instead, so the renderer names the handle type rather than either concretely.
+pub type ExportHandle = RawFd;
+
 /// Everything the consumer needs to import one dma-buf plane.
 #[derive(Clone, Copy, Debug)]
 pub struct DmabufInfo {
@@ -236,6 +243,12 @@ impl DmabufTarget {
 
     pub fn raw_fd(&self) -> RawFd {
         self._fd.as_raw_fd()
+    }
+
+    /// The platform-neutral spelling of [`Self::raw_fd`], so the renderer can
+    /// hand out export handles without knowing which OS it is on.
+    pub fn export_handle(&self) -> ExportHandle {
+        self.raw_fd()
     }
 }
 

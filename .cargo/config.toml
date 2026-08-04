@@ -1,0 +1,37 @@
+# Upstream Zed keeps these flags in this file; this fork does not carry it (the
+# `slop integration` commit renamed it to `.cloudflare/.cargo/config.toml`), so
+# Windows builds link without crt-static and fail in libwebrtc-sys with LNK2038:
+# livekit's prebuilt C++ objects are /MT while rustc's are /MD.
+#
+# Only the Windows section is reproduced. The upstream `[build] rustflags`
+# (v0 mangling, tokio_unstable) would apply to every target and invalidate the
+# Linux build cache, and nothing here needs it.
+#
+# Everything lives under the concrete triple rather than a `cfg(windows)`
+# section: `linker` is only honoured per-triple, and cargo does not merge
+# rustflags across the two forms.
+#
+# Link times on this workspace, measured (one-file change, then relink):
+#   link.exe, debug info, /INCREMENTAL   192m full; relink still going at 16m
+#   link.exe, no debug info               ~9-17m
+#   lld-link, no debug info               ~10-12m, and 17m for a full rebuild
+# /INCREMENTAL was the one lever aimed at relink time and it never engaged --
+# no .ilk is produced, because rustc recreates the binary instead of patching
+# it. Linux is faster here because Zed enables `wild`, which has no COFF
+# equivalent; neither link.exe nor lld-link parallelizes past ~1-3 of 18 cores.
+[target.aarch64-pc-windows-msvc]
+linker = "lld-link.exe"
+rustflags = [
+    "-C",
+    "target-feature=+crt-static",
+    # Measured, not assumed: with debug info lld spawns 26 threads but still runs
+    # the whole link at ~100% of ONE core (3-5 threads ever active, 5.4GB
+    # resident). The PDB phase is not what makes this link slow, so debug info
+    # buys nothing and costs a great deal -- link.exe with it took 192m for a
+    # full rebuild against 15m without.
+    # Temporarily line-tables (not 0) so the crash filter's backtrace resolves to
+    # function names and lines. Much cheaper than full debug info; revert to
+    # `debuginfo=0` once the access violation is understood.
+    "-C",
+    "debuginfo=1",
+]

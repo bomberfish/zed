@@ -840,6 +840,18 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 
+    /// Whether gpui must commit a keystroke's `key_char` itself because this
+    /// window gets no character message from the OS.
+    ///
+    /// True only for embed windows, which have no native window and therefore no
+    /// IME behind them. A real window must answer false or every typed character
+    /// lands twice: once here and once from the platform's own character message
+    /// (`WM_CHAR` on Windows). An embed process can own windows of both kinds --
+    /// zed's settings opens a real one -- so this cannot be a process-wide flag.
+    fn commits_key_char(&self) -> bool {
+        false
+    }
+
     // macOS specific methods
     fn get_title(&self) -> String {
         String::new()

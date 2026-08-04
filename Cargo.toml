@@ -909,6 +909,11 @@ features = [
     "Win32_Globalization",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
+    # D3D12 + the 11on12 interop layer: the embed renders with the existing D3D11
+    # renderer into a texture that is really a shared D3D12 resource, which is
+    # what the consumer's GdkD3D12TextureBuilder can import.
+    "Win32_Graphics_Direct3D11on12",
+    "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_DirectComposition",
     "Win32_Graphics_DirectWrite",

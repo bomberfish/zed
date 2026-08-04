@@ -15,7 +15,7 @@ use windows::Win32::{
         },
         Dxgi::{
             CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIFactory6,
+            IDXGIAdapter1, IDXGIDevice, IDXGIFactory6,
         },
     },
 };
@@ -68,6 +68,32 @@ impl DirectXDevices {
             dxgi_factory,
             device,
             device_context,
+        })
+    }
+
+    /// Wrap the D3D11 device an embed session already built on top of D3D12.
+    ///
+    /// That device cannot be created here: `CreateWrappedResource` only accepts
+    /// one made by `D3D11On12CreateDevice`. The adapter is recovered from the
+    /// device rather than re-enumerated, so both sides are guaranteed to be
+    /// talking about the same GPU.
+    pub(crate) fn from_embed(
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+    ) -> Result<Self> {
+        let dxgi_device: IDXGIDevice = device.cast().context("Casting to IDXGIDevice")?;
+        let adapter: IDXGIAdapter1 = unsafe { dxgi_device.GetAdapter() }
+            .context("Getting the adapter behind the embed device")?
+            .cast()
+            .context("Casting to IDXGIAdapter1")?;
+        let dxgi_factory = get_dxgi_factory(check_debug_layer_available())
+            .context("Creating DXGI factory for the embed device")?;
+
+        Ok(Self {
+            adapter,
+            dxgi_factory,
+            device: device.clone(),
+            device_context: device_context.clone(),
         })
     }
 }

@@ -27,6 +27,12 @@ use windows::{
     core::*,
 };
 
+use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
+
+use crate::embed::EmbedPipe;
+use crate::embed_window::{EmbedDisplay, EmbedWindow};
+use crate::shared_texture::SharedTextureDevices;
 use crate::*;
 use gpui::*;
 
@@ -50,6 +56,26 @@ pub struct WindowsPlatform {
     has_package_identity: bool,
     app_identity: RefCell<Option<(String, String)>>,
     system_notifications: RefCell<SystemNotificationState>,
+    /// Present only when `ZED_EMBED_PIPE` named a pipe to serve. Holds the
+    /// D3D12-backed devices the embed renders through and the connected pipe.
+    embed: Option<EmbedSession>,
+}
+
+/// The pieces an embed session needs before its window exists. The window is
+/// created later, by `open_window`, because GPUI owns window lifetime.
+struct EmbedSession {
+    devices: Rc<SharedTextureDevices>,
+    directx_devices: DirectXDevices,
+    pipe: Arc<EmbedPipe>,
+    /// Whether a window has already taken this connection.
+    ///
+    /// Zed opens windows of its own accord -- settings being the obvious one --
+    /// and every one of them reaches `open_window`. Binding a second window to
+    /// the same pipe would put two reader threads on one stream and send the
+    /// consumer a second handshake, which kills the session. Only the first
+    /// window is the embed; the rest open as ordinary on-screen windows, which is
+    /// also what makes zed's settings usable here.
+    claimed: Cell<bool>,
 }
 
 struct WindowsPlatformInner {
@@ -102,11 +128,135 @@ impl WindowsPlatformState {
 }
 
 impl WindowsPlatform {
+    /// Build the embed window and start the session: hand the consumer a
+    /// duplicated handle to the shared texture, then drive frames and input.
+    fn open_embed_window(
+        &self,
+        options: WindowParams,
+        session: &EmbedSession,
+    ) -> Result<Box<dyn PlatformWindow>> {
+        let display = Rc::new(EmbedDisplay::new()) as Rc<dyn PlatformDisplay>;
+        let consumer = session
+            .pipe
+            .consumer_process()
+            .context("Identifying the embed consumer process")?;
+        let window = EmbedWindow::new(
+            options,
+            display,
+            session.devices.clone(),
+            &session.directx_devices,
+            consumer,
+        )?;
+
+        let (handle, width, height) = window
+            .share()
+            .context("Sharing the embed texture with the consumer")?;
+        // Mode byte first, then the handshake: that is the order the consumer
+        // reads them in.
+        crate::embed::send_mode(&session.pipe, true).context("Sending the transport mode")?;
+        crate::embed::send_handshake(&session.pipe, handle, width, height)
+            .context("Sending the embed handshake")?;
+
+        let pipe = session.pipe.clone();
+        window.set_on_frame(Box::new(move |width, height| {
+            if let Err(error) = crate::embed::send_ready(&pipe, width, height) {
+                log::error!("[zed-embed] frame notification failed: {error:#}");
+            }
+        }));
+        // A resize reallocates the target, so the consumer needs a new handle.
+        let pipe = session.pipe.clone();
+        window.set_on_reshare(Box::new(move |handle, width, height| {
+            if let Err(error) = crate::embed::send_handshake(&pipe, handle, width, height) {
+                log::error!("[zed-embed] re-handshake after resize failed: {error:#}");
+            }
+        }));
+        let pipe = session.pipe.clone();
+        window.set_on_title_change(Box::new(move |title| {
+            if let Err(error) = crate::embed::send_title(&pipe, title) {
+                log::error!("[zed-embed] title update failed: {error:#}");
+            }
+        }));
+
+        let receiver = crate::embed::spawn_reader(session.pipe.clone());
+        let weak = window.downgrade();
+        let background = self.background_executor();
+        self.foreground_executor()
+            .spawn(async move {
+                let mut input_state = crate::embed::EmbedInputState::default();
+                loop {
+                    // ~60Hz. The consumer has no way to request a frame, so the
+                    // session polls rather than waiting for damage.
+                    background.timer(Duration::from_millis(16)).await;
+                    let Some(window) = weak.upgrade() else {
+                        break;
+                    };
+                    window.ensure_active();
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(input) => {
+                                input_state.apply(input, &window);
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                log::info!("[zed-embed] consumer disconnected; closing");
+                                window.close();
+                                return;
+                            }
+                        }
+                    }
+                    window.tick_frame();
+                }
+            })
+            .detach();
+
+        Ok(Box::new(window))
+    }
+
     pub fn new(headless: bool) -> Result<Self> {
         unsafe {
             OleInitialize(None).context("unable to initialize Windows OLE")?;
         }
-        let (directx_devices, text_system, direct_write_text_system) = if !headless {
+
+        // Embed mode is decided before anything else, because it supplies the
+        // devices everything downstream is built on.
+        //
+        // It also overrides `headless`. The daemon sets ZED_HEADLESS=1 for embeds
+        // to match Linux, where the headless platform *is* the embed platform and
+        // brings its own renderer and text stack. Here headless means "no GPU, no
+        // DirectWrite", which for an embed would render every frame with
+        // `NoopTextSystem` -- a window with no text in it.
+        if std::env::var_os(crate::embed::EMBED_ENDPOINT_VAR).is_some() {
+            crate::embed::install_crash_filter();
+        }
+        let embed_devices = match std::env::var(crate::embed::EMBED_ENDPOINT_VAR) {
+            Ok(name) if !name.is_empty() => Some((
+                name,
+                Rc::new(
+                    SharedTextureDevices::new().context("Creating embed shared-texture devices")?,
+                ),
+            )),
+            _ => None,
+        };
+        let headless = headless && embed_devices.is_none();
+
+        let (directx_devices, text_system, direct_write_text_system) = if let Some((_, devices)) =
+            embed_devices.as_ref()
+        {
+            // Built on the embed's own device, not a second one: the glyph atlas
+            // DirectWrite fills has to live on the device the renderer draws
+            // with, or its textures are unusable at draw time.
+            let devices = DirectXDevices::from_embed(&devices.device, &devices.device_context)
+                .context("Adopting the embed D3D11 device")?;
+            let dw_text_system = Arc::new(
+                DirectWriteTextSystem::new(&devices)
+                    .context("Error creating DirectWriteTextSystem for the embed")?,
+            );
+            (
+                Some(devices),
+                dw_text_system.clone() as Arc<dyn PlatformTextSystem>,
+                Some(dw_text_system),
+            )
+        } else if !headless {
             let devices = DirectXDevices::new().context("Creating DirectX devices")?;
             let dw_text_system = Arc::new(
                 DirectWriteTextSystem::new(&devices)
@@ -140,7 +290,9 @@ impl WindowsPlatform {
             validation_number,
             main_sender: Some(main_sender),
             main_receiver: Some(main_receiver),
-            directx_devices,
+            // Cloned: the embed session below needs the same devices, and
+            // DirectXDevices is a handful of refcounted COM pointers.
+            directx_devices: directx_devices.clone(),
             dispatcher: None,
         };
         let result = unsafe {
@@ -188,6 +340,39 @@ impl WindowsPlatform {
             HICON::default()
         };
 
+        // Blocks until the consumer connects, the same way the Linux client waits
+        // on its socket: there is nothing to render into until the shared texture
+        // can be handed over.
+        let embed = match embed_devices {
+            Some((name, devices)) => {
+                let directx_devices = directx_devices
+                    .context("embed mode built no DirectX devices")?;
+                let pipe = Arc::new(EmbedPipe::serve(&name).context("Serving the embed pipe")?);
+                // Before anything else: the consumer opens with the project path.
+                match crate::embed::read_cwd(&pipe) {
+                    Ok(path) => {
+                        log::info!("[zed-embed] consumer connected on {name} for {path:?}");
+                        gpui::embed_palette::push_embed_path(path);
+                    }
+                    Err(error) => {
+                        log::error!("[zed-embed] reading the consumer's cwd: {error:#}");
+                    }
+                }
+                // Nothing opens a window until this is bumped: `init_embed_windows`
+                // polls the connection count and opens one window per new
+                // connection. Pushing the path without counting the connection
+                // leaves the app idle and the host pane blank.
+                gpui::embed_palette::note_embed_connection();
+                Some(EmbedSession {
+                    devices,
+                    directx_devices,
+                    pipe,
+                    claimed: Cell::new(false),
+                })
+            }
+            None => None,
+        };
+
         Ok(Self {
             inner,
             handle,
@@ -201,6 +386,7 @@ impl WindowsPlatform {
             suspend_resume_notification: RefCell::new(None),
             disable_direct_composition,
             has_package_identity: has_package_identity(),
+            embed,
             drop_target_helper,
             invalidate_devices: Arc::new(AtomicBool::new(false)),
             app_identity: RefCell::new(None),
@@ -303,7 +489,7 @@ impl WindowsPlatform {
             .map(|hwnd| hwnd.as_raw())
     }
 
-    fn begin_vsync_thread(&self) {
+    fn begin_vsync_thread(&self, embed: bool) {
         let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
             return;
         };
@@ -326,6 +512,18 @@ impl WindowsPlatform {
                     if check_device_lost(&directx_device.device)
                         || invalidate_devices.fetch_and(false, Ordering::Acquire)
                     {
+                        // Recovery recreates the D3D11/D3D12 devices, and in an
+                        // embed session those are the ones backing the texture
+                        // shared with the consumer -- the renderer would be left
+                        // calling through released COM objects. Report it and
+                        // keep pumping vsync so ordinary windows still repaint.
+                        if embed {
+                            log::error!(
+                                "[zed-embed] GPU device lost; not recreating devices \
+                                 (the shared texture depends on them)"
+                            );
+                            continue;
+                        }
                         if let Err(err) = handle_gpu_device_lost(
                             &mut directx_device,
                             platform_window.as_raw(),
@@ -407,8 +605,12 @@ impl Platform for WindowsPlatform {
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
         on_finish_launching();
+        // Started for embeds too: zed opens real windows of its own (settings),
+        // and without this thread nothing drives their repaint. Its device-lost
+        // recovery is what an embed cannot tolerate, and that is guarded inside
+        // rather than by skipping the whole thread.
         if !self.headless {
-            self.begin_vsync_thread();
+            self.begin_vsync_thread(self.embed.is_some());
         }
 
         let mut msg = MSG::default();
@@ -523,6 +725,12 @@ impl Platform for WindowsPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
+        if let Some(session) = self.embed.as_ref()
+            && !session.claimed.replace(true)
+        {
+            return self.open_embed_window(options, session);
+        }
+
         let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
         let handle = window.get_raw_handle();
         self.raw_window_handles.write().push(handle.into());
@@ -773,10 +981,29 @@ impl Platform for WindowsPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
+        // In an embed session this process has no clipboard of its own worth
+        // writing to — the host owns the real system clipboard, so a copy is
+        // forwarded there instead.
+        if let Some(session) = self.embed.as_ref() {
+            if let Some(text) = item.text()
+                && let Err(error) = crate::embed::send_clipboard(&session.pipe, &text)
+            {
+                log::error!("[zed-embed] forwarding a copy to the host failed: {error:#}");
+            }
+            return;
+        }
         write_to_clipboard(item);
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
+        // Paste reads what the host last pushed, so it sees real system
+        // clipboard content rather than only this process's own copies.
+        if self.embed.is_some() {
+            return crate::embed::CLIPBOARD_CACHE
+                .lock()
+                .clone()
+                .map(ClipboardItem::new_string);
+        }
         read_from_clipboard()
     }
 

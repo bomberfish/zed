@@ -66,9 +66,17 @@ pub(crate) struct DirectXRendererDevices {
     annotation: Option<ID3DUserDefinedAnnotation>,
 }
 
+/// Where the frame lands. On screen that is a swap chain's back buffer; in an
+/// embed session it is a texture shared with the consumer process, which is
+/// presented by handing it back to D3D12 rather than by `Present`.
+enum RenderTargetSource {
+    SwapChain(IDXGISwapChain1),
+    Offscreen(ID3D11Texture2D),
+}
+
 struct DirectXResources {
     // Direct3D rendering objects
-    swap_chain: IDXGISwapChain1,
+    target: RenderTargetSource,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
@@ -175,7 +183,11 @@ impl DirectXRenderer {
             let composition = DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), hwnd)
                 .context("Creating DirectComposition")?;
             composition
-                .set_swap_chain(&resources.swap_chain)
+                .set_swap_chain(
+                    resources
+                        .swap_chain()
+                        .context("DirectComposition requires a swap chain")?,
+                )
                 .context("Setting swap chain for DirectComposition")?;
             Some(composition)
         };
@@ -193,6 +205,68 @@ impl DirectXRenderer {
             height: 1,
             skip_draws: false,
         })
+    }
+
+    /// A renderer with no window, drawing into `texture` (the D3D11 projection
+    /// of the shared resource the embed consumer imports). DirectComposition is
+    /// meaningless without an HWND, so it is off and `hwnd` stays null.
+    pub(crate) fn new_offscreen(
+        directx_devices: &DirectXDevices,
+        texture: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let devices = DirectXRendererDevices::new(directx_devices, true)
+            .context("Creating DirectX devices for offscreen rendering")?;
+        let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
+        let resources = DirectXResources::new_offscreen(&devices, texture, width, height)
+            .context("Creating offscreen DirectX resources")?;
+        let globals = DirectXGlobalElements::new(&devices.device)
+            .context("Creating DirectX global elements")?;
+        let pipelines = DirectXRenderPipelines::new(&devices.device)
+            .context("Creating DirectX render pipelines")?;
+
+        Ok(DirectXRenderer {
+            hwnd: HWND::default(),
+            atlas,
+            devices: Some(devices),
+            resources: Some(resources),
+            globals,
+            pipelines,
+            direct_composition: None,
+            font_info: Self::get_font_info(),
+            width,
+            height,
+            skip_draws: false,
+        })
+    }
+
+    /// Point the renderer at a new shared texture after a resize.
+    ///
+    /// Unlike the dma-buf path, a D3D12 texture cannot be sampled as a sub-rect
+    /// of a larger one: `GdkD3D12TextureBuilder` takes its dimensions from the
+    /// resource. So the target is reallocated at the active size and re-shared
+    /// rather than over-allocated once.
+    pub(crate) fn set_offscreen_target(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        resources.render_target.take();
+        resources.render_target_view.take();
+        resources.target = RenderTargetSource::Offscreen(texture.clone());
+        resources.recreate_resources(devices, width, height)?;
+        unsafe {
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+        }
+        self.width = width;
+        self.height = height;
+        Ok(())
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -235,14 +309,16 @@ impl DirectXRenderer {
 
     #[inline]
     fn present(&mut self) -> Result<()> {
-        let result = unsafe {
-            self.resources
-                .as_ref()
-                .expect("resources missing")
-                .swap_chain
-                .Present(0, DXGI_PRESENT(0))
-        };
-        result.ok().context("Presenting swap chain failed")
+        match &self.resources.as_ref().expect("resources missing").target {
+            RenderTargetSource::SwapChain(swap_chain) => unsafe {
+                swap_chain.Present(0, DXGI_PRESENT(0)).ok()
+            }
+            .context("Presenting swap chain failed"),
+            // The embed's frame becomes visible when the shared texture is
+            // released back to D3D12, which the embed window does around the
+            // draw rather than here.
+            RenderTargetSource::Offscreen(_) => Ok(()),
+        }
     }
 
     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
@@ -298,7 +374,11 @@ impl DirectXRenderer {
         } else {
             let composition =
                 DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
-            composition.set_swap_chain(&resources.swap_chain)?;
+            composition.set_swap_chain(
+                resources
+                    .swap_chain()
+                    .context("DirectComposition requires a swap chain")?,
+            )?;
             Some(composition)
         };
 
@@ -403,17 +483,18 @@ impl DirectXRenderer {
         // The app might have moved to a monitor that's attached to a different graphics device.
         // When a graphics device is removed or reset, the desktop resolution often changes, resulting in a window size change.
         // But here we just return the error, because we are handling device lost scenarios elsewhere.
-        unsafe {
-            resources
-                .swap_chain
-                .ResizeBuffers(
-                    BUFFER_COUNT as u32,
-                    width,
-                    height,
-                    RENDER_TARGET_FORMAT,
-                    DXGI_SWAP_CHAIN_FLAG(0),
-                )
-                .context("Failed to resize swap chain")?;
+        if let Some(swap_chain) = resources.swap_chain() {
+            unsafe {
+                swap_chain
+                    .ResizeBuffers(
+                        BUFFER_COUNT as u32,
+                        width,
+                        height,
+                        RENDER_TARGET_FORMAT,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                    .context("Failed to resize swap chain")?;
+            }
         }
 
         resources.recreate_resources(devices, width, height)?;
@@ -783,6 +864,16 @@ impl DirectXRenderer {
 }
 
 impl DirectXResources {
+    /// The swap chain, when there is one. Embed sessions render offscreen and
+    /// have none, so anything swap-chain-specific (presenting, resizing buffers,
+    /// DirectComposition) has to tolerate its absence.
+    fn swap_chain(&self) -> Option<&IDXGISwapChain1> {
+        match &self.target {
+            RenderTargetSource::SwapChain(swap_chain) => Some(swap_chain),
+            RenderTargetSource::Offscreen(_) => None,
+        }
+    }
+
     pub fn new(
         devices: &DirectXRendererDevices,
         width: u32,
@@ -800,6 +891,7 @@ impl DirectXResources {
                 height,
             )?
         };
+        let target = RenderTargetSource::SwapChain(swap_chain);
 
         let (
             render_target,
@@ -809,11 +901,44 @@ impl DirectXResources {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
+        ) = create_resources(devices, &target, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
-            swap_chain,
+            target,
+            render_target: Some(render_target),
+            render_target_view,
+            path_intermediate_texture,
+            path_intermediate_msaa_texture,
+            path_intermediate_msaa_view,
+            path_intermediate_srv,
+            viewport,
+        })
+    }
+
+    /// Resources that draw into a caller-owned texture instead of a swap chain.
+    /// The texture is the D3D11 projection of the shared D3D12 resource the
+    /// consumer imports; see [`crate::shared_texture`].
+    pub fn new_offscreen(
+        devices: &DirectXRendererDevices,
+        texture: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let target = RenderTargetSource::Offscreen(texture.clone());
+        let (
+            render_target,
+            render_target_view,
+            path_intermediate_texture,
+            path_intermediate_srv,
+            path_intermediate_msaa_texture,
+            path_intermediate_msaa_view,
+            viewport,
+        ) = create_resources(devices, &target, width, height)?;
+        set_rasterizer_state(&devices.device, &devices.device_context)?;
+
+        Ok(Self {
+            target,
             render_target: Some(render_target),
             render_target_view,
             path_intermediate_texture,
@@ -839,7 +964,7 @@ impl DirectXResources {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
+        ) = create_resources(devices, &self.target, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
         self.path_intermediate_texture = path_intermediate_texture;
@@ -1264,7 +1389,7 @@ fn create_swap_chain(
 #[inline]
 fn create_resources(
     devices: &DirectXRendererDevices,
-    swap_chain: &IDXGISwapChain1,
+    target: &RenderTargetSource,
     width: u32,
     height: u32,
 ) -> Result<(
@@ -1277,7 +1402,7 @@ fn create_resources(
     D3D11_VIEWPORT,
 )> {
     let (render_target, render_target_view) =
-        create_render_target_and_its_view(swap_chain, &devices.device)?;
+        create_render_target_and_its_view(target, &devices.device)?;
     let (path_intermediate_texture, path_intermediate_srv) =
         create_path_intermediate_texture(&devices.device, width, height)?;
     let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
@@ -1296,10 +1421,14 @@ fn create_resources(
 
 #[inline]
 fn create_render_target_and_its_view(
-    swap_chain: &IDXGISwapChain1,
+    target: &RenderTargetSource,
     device: &ID3D11Device,
 ) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)> {
-    let render_target: ID3D11Texture2D = unsafe { swap_chain.GetBuffer(0) }?;
+    let render_target: ID3D11Texture2D = match target {
+        RenderTargetSource::SwapChain(swap_chain) => unsafe { swap_chain.GetBuffer(0) }?,
+        // Already a texture: the 11on12-wrapped resource the consumer imports.
+        RenderTargetSource::Offscreen(texture) => texture.clone(),
+    };
     let mut render_target_view = None;
     unsafe { device.CreateRenderTargetView(&render_target, None, Some(&mut render_target_view))? };
     Ok((render_target, render_target_view))
