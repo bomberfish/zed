@@ -22,33 +22,6 @@ pub struct CompositorGpuHint {
     pub device_id: u32,
 }
 
-/// Windows picks the offscreen adapter by export capability rather than by
-/// preference, because the fastest adapter there may be unable to share memory
-/// at all. Nothing to override elsewhere: on Linux any Vulkan adapter that can
-/// render can export a dma-buf.
-#[cfg(all(windows, not(target_family = "wasm")))]
-async fn preferred_export_adapter(
-    instance: &wgpu::Instance,
-    dmabuf: bool,
-) -> Option<wgpu::Adapter> {
-    if !dmabuf {
-        return None;
-    }
-    let adapter = crate::win32::select_exportable_adapter(instance).await;
-    if adapter.is_none() {
-        log::warn!("no adapter supports VK_KHR_external_memory_win32; embed cannot share textures");
-    }
-    adapter
-}
-
-#[cfg(all(not(windows), not(target_family = "wasm")))]
-async fn preferred_export_adapter(
-    _instance: &wgpu::Instance,
-    _dmabuf: bool,
-) -> Option<wgpu::Adapter> {
-    None
-}
-
 impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn new(
@@ -75,21 +48,18 @@ impl WgpuContext {
     pub fn new_offscreen(instance: wgpu::Instance, dmabuf: bool) -> anyhow::Result<Self> {
         let (adapter, device, queue, dual_source_blending, color_texture_format) =
             gpui::block_on(async {
-                let adapter = match preferred_export_adapter(&instance, dmabuf).await {
-                    Some(adapter) => adapter,
-                    None => instance
-                        .request_adapter(&wgpu::RequestAdapterOptions {
-                            power_preference: wgpu::PowerPreference::HighPerformance,
-                            compatible_surface: None,
-                            force_fallback_adapter: false,
-                        })
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to request GPU adapter: {e}"))?,
-                };
+                let adapter = instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: None,
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to request GPU adapter: {e}"))?;
                 // dma-buf export needs a device opened with Vulkan external-memory
                 // extensions; otherwise the plain surfaceless device is fine.
                 let (device, queue, dual_source_blending, color_texture_format) = if dmabuf {
-                    let (device, queue) = crate::export::create_device(&adapter)?;
+                    let (device, queue) = crate::dmabuf::create_device(&adapter)?;
                     let color = Self::select_color_texture_format(&adapter)?;
                     // The dma-buf device is opened with no extra wgpu features,
                     // so dual-source blending is off (grayscale text AA only).

@@ -43,10 +43,6 @@ pollster.workspace = true
 # `vk::*` handle types unify across the `wgpu::hal` boundary.
 ash = "0.38"
 
-[target.'cfg(windows)'.dependencies]
-# CloseHandle, for the NT handle the shared-texture export owns.
-windows.workspace = true
-
 [target.'cfg(target_family = "wasm")'.dependencies]
 wasm-bindgen.workspace = true
 wasm-bindgen-futures = "0.4"

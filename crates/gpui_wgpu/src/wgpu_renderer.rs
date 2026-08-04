@@ -171,7 +171,7 @@ pub struct WgpuRenderer {
     // top-left, so resizing needs no re-export. `on_dmabuf` reports the target
     // index plus the active (rendered) width/height for the consumer to sample.
     #[cfg(not(target_family = "wasm"))]
-    dmabuf_targets: Vec<crate::export::ExportTarget>,
+    dmabuf_targets: Vec<crate::dmabuf::DmabufTarget>,
     #[cfg(not(target_family = "wasm"))]
     dmabuf_index: usize,
     #[cfg(not(target_family = "wasm"))]
@@ -342,7 +342,7 @@ impl WgpuRenderer {
         max_width: u32,
         max_height: u32,
         count: usize,
-    ) -> anyhow::Result<(crate::export::ExportInfo, Vec<crate::export::ExportHandle>)> {
+    ) -> anyhow::Result<(crate::dmabuf::DmabufInfo, Vec<std::os::fd::RawFd>)> {
         use anyhow::Context as _;
 
         let instance = {
@@ -358,15 +358,15 @@ impl WgpuRenderer {
 
         let mut targets = Vec::with_capacity(count);
         for _ in 0..count {
-            targets.push(crate::export::ExportTarget::new(
+            targets.push(crate::dmabuf::DmabufTarget::new(
                 &device, &instance, max_width, max_height,
             )?);
         }
         let info = targets[0].info;
-        let handles = targets.iter().map(|target| target.export_handle()).collect();
+        let fds = targets.iter().map(|t| t.raw_fd()).collect();
         self.dmabuf_targets = targets;
         self.dmabuf_index = 0;
-        Ok((info, handles))
+        Ok((info, fds))
     }
 
     /// Max dma-buf target dimensions, so callers can clamp the active size to

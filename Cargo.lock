@@ -8079,7 +8079,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "wgpu",
- "windows 0.61.3",
  "zed-font-kit",
 ]
 
