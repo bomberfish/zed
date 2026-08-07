@@ -16,7 +16,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{
-    KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta,
     ScrollWheelEvent, TouchPhase, point, px,
 };
@@ -117,6 +118,10 @@ pub(crate) enum EmbedInput {
     },
     Palette {
         colors: [u32; 13],
+    },
+    /// A modifier pressed or released on its own; carries the resulting state.
+    ModifiersChanged {
+        modifiers: Modifiers,
     },
     Clipboard {
         text: String,
@@ -398,6 +403,12 @@ pub(crate) fn send_mode(pipe: &EmbedPipe, zero_copy: bool) -> Result<()> {
 /// `SHTX` rather than Linux's `DMAB` because the payload is a different kind of
 /// thing — one shareable D3D12 resource, not a dma-buf plane with stride and
 /// modifier.
+/// `SHTX` + handle u64 + width u32 + height u32 — the first buffer and the size.
+///
+/// Deliberately unchanged at 16 bytes: the consumer reads this body at a fixed
+/// length with no length prefix, so appending fields here would simply block a
+/// consumer that predates them. The second buffer and the fence travel as their
+/// own message instead.
 pub(crate) fn send_handshake(pipe: &EmbedPipe, handle: isize, width: u32, height: u32) -> Result<()> {
     let mut payload = Vec::with_capacity(20);
     payload.extend_from_slice(b"SHTX");
@@ -407,15 +418,37 @@ pub(crate) fn send_handshake(pipe: &EmbedPipe, handle: isize, width: u32, height
     pipe.write_all(&payload)
 }
 
-/// Per-frame notification: the active sub-rect of the shared target to sample.
+/// `SHT2` + handle u64 + fence u64, sent immediately after every `SHTX`.
 ///
-/// The buffer index is always zero — there is one shared resource here, not a
-/// ring of dma-buf planes — but it is still sent, so the consumer parses `RDY!`
-/// identically on both platforms.
-pub(crate) fn send_ready(pipe: &EmbedPipe, width: u32, height: u32) -> Result<()> {
+/// The second of the two targets frames alternate between, and the fence their
+/// completion is signalled on. `fence` is 0 on a re-handshake after a resize:
+/// the targets are reallocated but the fence is not, and re-sharing it would
+/// leak a handle per resize for no gain.
+pub(crate) fn send_shared_extra(pipe: &EmbedPipe, handle: isize, fence: isize) -> Result<()> {
+    let mut payload = Vec::with_capacity(20);
+    payload.extend_from_slice(b"SHT2");
+    payload.extend_from_slice(&(handle as u64).to_le_bytes());
+    payload.extend_from_slice(&(fence as u64).to_le_bytes());
+    pipe.write_all(&payload)
+}
+
+/// The fence value the frame announced by the next `RDY!` completes at.
+///
+/// Sent as its own message immediately before it, rather than as an extra `RDY!`
+/// field, so `RDY!` stays byte-identical to the Linux one and the consumer keeps
+/// a single parser for both platforms.
+pub(crate) fn send_fence_value(pipe: &EmbedPipe, value: u64) -> Result<()> {
+    let mut payload = Vec::with_capacity(12);
+    payload.extend_from_slice(b"FNCV");
+    payload.extend_from_slice(&value.to_le_bytes());
+    pipe.write_all(&payload)
+}
+
+/// Per-frame notification: which buffer, and the active sub-rect of it to sample.
+pub(crate) fn send_ready(pipe: &EmbedPipe, index: u32, width: u32, height: u32) -> Result<()> {
     let mut payload = Vec::with_capacity(16);
     payload.extend_from_slice(b"RDY!");
-    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&index.to_le_bytes());
     payload.extend_from_slice(&width.to_le_bytes());
     payload.extend_from_slice(&height.to_le_bytes());
     pipe.write_all(&payload)
@@ -487,16 +520,28 @@ pub(crate) fn read_input(pipe: &EmbedPipe) -> Result<EmbedInput> {
             let mut char_len = [0u8; 1];
             pipe.read_exact(&mut char_len)?;
             let key_char = read_string(pipe, char_len[0] as usize)?;
+            let modifiers = Modifiers {
+                control: modifiers & MOD_CTRL != 0,
+                alt: modifiers & MOD_ALT != 0,
+                shift: modifiers & MOD_SHIFT != 0,
+                platform: modifiers & MOD_PLATFORM != 0,
+                function: false,
+            };
+            // An empty key name means the consumer pressed or released a MODIFIER
+            // on its own. That is not a keystroke in gpui's model — natively it
+            // arrives as `ModifiersChanged`, and alt/ctrl/shift live in
+            // `Modifiers` rather than being keys — so forwarding it as a KeyDown
+            // named `alt_l` (which is what the consumer used to send, from
+            // `keyval.name()`) matched no binding and looked like the key was
+            // never delivered at all. The length byte makes 0 a legal length, so
+            // this needs no new tag.
+            if key.is_empty() {
+                return Ok(EmbedInput::ModifiersChanged { modifiers });
+            }
             Ok(EmbedInput::Key {
                 key,
                 key_char: (!key_char.is_empty()).then_some(key_char),
-                modifiers: Modifiers {
-                    control: modifiers & MOD_CTRL != 0,
-                    alt: modifiers & MOD_ALT != 0,
-                    shift: modifiers & MOD_SHIFT != 0,
-                    platform: modifiers & MOD_PLATFORM != 0,
-                    function: false,
-                },
+                modifiers,
                 pressed,
             })
         }
@@ -642,6 +687,15 @@ impl EmbedInputState {
                     modifiers: Modifiers::default(),
                     touch_phase: TouchPhase::Moved,
                 }));
+            }
+            EmbedInput::ModifiersChanged { modifiers } => {
+                window.dispatch_input(PlatformInput::ModifiersChanged(
+                    ModifiersChangedEvent {
+                        modifiers,
+                        capslock: Capslock { on: false },
+                    },
+                ));
+                return false;
             }
             EmbedInput::Key {
                 key,

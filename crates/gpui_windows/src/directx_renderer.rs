@@ -247,6 +247,31 @@ impl DirectXRenderer {
     /// of a larger one: `GdkD3D12TextureBuilder` takes its dimensions from the
     /// resource. So the target is reallocated at the active size and re-shared
     /// rather than over-allocated once.
+    /// Point drawing at another offscreen texture of the SAME size.
+    ///
+    /// Distinct from `set_offscreen_target`, which goes through
+    /// `recreate_resources` and therefore reallocates the path-intermediate and
+    /// MSAA textures — full-size allocations, fine per resize and far too
+    /// expensive per frame. The embed alternates between two shared textures on
+    /// every frame so the consumer never samples the one being drawn into, and
+    /// all that has to change for that is the render-target view: the
+    /// intermediates depend on the size, which is unchanged.
+    pub(crate) fn bind_offscreen_target(&mut self, texture: &ID3D11Texture2D) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        resources.target = RenderTargetSource::Offscreen(texture.clone());
+        let (render_target, render_target_view) =
+            create_render_target_and_its_view(&resources.target, &devices.device)?;
+        resources.render_target = Some(render_target);
+        resources.render_target_view = render_target_view;
+        unsafe {
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_offscreen_target(
         &mut self,
         texture: &ID3D11Texture2D,

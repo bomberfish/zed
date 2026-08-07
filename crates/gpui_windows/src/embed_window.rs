@@ -66,10 +66,33 @@ struct EmbedWindowState {
 
     devices: Rc<SharedTextureDevices>,
     renderer: DirectXRenderer,
-    /// Sized to the content, not over-allocated: the consumer's importer takes
-    /// the texture's dimensions from the resource itself, so anything larger
-    /// would display as content in the corner of an oversized texture.
-    shared: SharedTexture,
+    /// Two targets, alternated per frame, sized to the content rather than
+    /// over-allocated: the consumer's importer takes the texture's dimensions
+    /// from the resource itself, so anything larger would display as content in
+    /// the corner of an oversized texture.
+    ///
+    /// Two and not one because the consumer samples asynchronously. With a single
+    /// target the next frame's writes land in the very texture GTK is reading,
+    /// which shows up as horizontal tearing; the fence only orders the announced
+    /// frame's writes ahead of the read, it cannot hold back the frame after it.
+    /// Mirrors the Linux path, which allocates two dma-buf planes for the same
+    /// reason and sends the plane index per frame.
+    shared: [SharedTexture; 2],
+    /// Which of `shared` the next frame draws into.
+    next_buffer: usize,
+    /// Force the next frame even if GPUI considers the window clean.
+    ///
+    /// The tick used to pass `force_render: true` unconditionally, which meant a
+    /// full scene rebuild + rasterization on EVERY tick — and the tick runs off
+    /// the vsync thread, so an idle embed re-rendered at display refresh rate
+    /// forever while a native window idles at zero. That is what made the embed
+    /// slower than native despite the zero-copy handoff; the copy was never the
+    /// cost.
+    ///
+    /// Dirty-tracking cannot cover the cases where the OUTPUT changed without the
+    /// scene changing: a consumer that just connected has no pixels yet, and a
+    /// resize or scale change reallocates the targets. Those set this.
+    force_frame: bool,
     /// The consumer, kept so a resize can duplicate the new handle to it.
     consumer_process: HANDLE,
     /// Device-pixel size of the shared target, which is what the consumer sends.
@@ -79,8 +102,9 @@ struct EmbedWindowState {
     /// Reported by `scale_factor`. The consumer's display scale times the user's
     /// editor multiplier -- 1.0 until it says otherwise.
     scale: f32,
-    /// Sends a fresh handshake after the target is reallocated.
-    reshare: Option<Box<dyn FnMut(isize, u32, u32)>>,
+    /// Sends a fresh handshake after the targets are reallocated: both texture
+    /// handles, then the size.
+    reshare: Option<Box<dyn FnMut([isize; 2], u32, u32)>>,
 
     request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     input: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
@@ -90,9 +114,10 @@ struct EmbedWindowState {
     activated: bool,
     hover_status_change: Option<Box<dyn FnMut(bool)>>,
     title_change: Option<Box<dyn FnMut(&str)>>,
-    /// Fired after each frame reaches the shared texture: active width/height,
-    /// for the consumer to know which sub-rect of the target to sample.
-    on_frame: Option<Box<dyn FnMut(u32, u32)>>,
+    /// Fired after each frame reaches a shared texture: which buffer, the active
+    /// width/height (the sub-rect of it to sample), and the fence value that
+    /// frame's writes complete at.
+    on_frame: Option<Box<dyn FnMut(usize, u32, u32, u64)>>,
 }
 
 #[derive(Clone)]
@@ -136,11 +161,20 @@ impl EmbedWindow {
     ) -> Result<Self> {
         let width = f32::from(params.bounds.size.width).max(1.0) as u32;
         let height = f32::from(params.bounds.size.height).max(1.0) as u32;
-        let shared = SharedTexture::new(&devices, width, height)
-            .context("Creating the shared embed texture")?;
-        let renderer =
-            DirectXRenderer::new_offscreen(directx_devices, shared.render_target_texture(), width, height)
-                .context("Creating the offscreen renderer")?;
+        let shared = [
+            SharedTexture::new(&devices, width, height)
+                .context("Creating the first shared embed texture")?,
+            SharedTexture::new(&devices, width, height)
+                .context("Creating the second shared embed texture")?,
+        ];
+        // Bound to buffer 0 here; `draw` rebinds per frame as it alternates.
+        let renderer = DirectXRenderer::new_offscreen(
+            directx_devices,
+            shared[0].render_target_texture(),
+            width,
+            height,
+        )
+        .context("Creating the offscreen renderer")?;
 
         Ok(Self(Rc::new(RefCell::new(EmbedWindowState {
             bounds: params.bounds,
@@ -151,6 +185,9 @@ impl EmbedWindow {
             devices,
             renderer,
             shared,
+            next_buffer: 0,
+            // The first frame always happens: a fresh consumer has nothing.
+            force_frame: true,
             consumer_process,
             pixels: (width, height),
             scale: 1.0,
@@ -171,19 +208,29 @@ impl EmbedWindow {
         WeakEmbedWindow(Rc::downgrade(&self.0))
     }
 
-    /// The shared handle duplicated into the consumer, plus its dimensions.
-    pub(crate) fn share(&self) -> Result<(isize, u32, u32)> {
+    /// Both shared handles duplicated into the consumer, plus their dimensions.
+    pub(crate) fn share(&self) -> Result<([isize; 2], u32, u32)> {
         let state = self.0.borrow();
-        let handle = state.shared.share_with(state.consumer_process)?;
-        Ok((handle, state.shared.width, state.shared.height))
+        let handles = [
+            state.shared[0].share_with(state.consumer_process)?,
+            state.shared[1].share_with(state.consumer_process)?,
+        ];
+        Ok((handles, state.shared[0].width, state.shared[0].height))
     }
 
-    /// Called after a resize reallocates the shared target, with the new handle.
-    pub(crate) fn set_on_reshare(&self, callback: Box<dyn FnMut(isize, u32, u32)>) {
+    /// The frame-completion fence, duplicated into the consumer. Sent once, with
+    /// the handshake: the fence outlives target reallocation.
+    pub(crate) fn share_fence(&self) -> Result<isize> {
+        let state = self.0.borrow();
+        state.devices.share_fence_with(state.consumer_process)
+    }
+
+    /// Called after a resize reallocates the shared targets, with the new handles.
+    pub(crate) fn set_on_reshare(&self, callback: Box<dyn FnMut([isize; 2], u32, u32)>) {
         self.0.borrow_mut().reshare = Some(callback);
     }
 
-    pub(crate) fn set_on_frame(&self, callback: Box<dyn FnMut(u32, u32)>) {
+    pub(crate) fn set_on_frame(&self, callback: Box<dyn FnMut(usize, u32, u32, u64)>) {
         self.0.borrow_mut().on_frame = Some(callback);
     }
 
@@ -193,14 +240,25 @@ impl EmbedWindow {
 
     /// Ask GPUI to produce and present a frame. Driven by the session's clock.
     pub(crate) fn tick_frame(&self) {
+        // Consume the one-shot force. Otherwise GPUI's invalidator decides, which
+        // is what a native window does: no damage, no frame.
+        let forced = {
+            let mut state = self.0.borrow_mut();
+            std::mem::replace(&mut state.force_frame, false)
+        };
         let mut callback = self.0.borrow_mut().request_frame.take();
         if let Some(callback) = callback.as_mut() {
             callback(RequestFrameOptions {
-                require_presentation: true,
-                force_render: true,
+                require_presentation: forced,
+                force_render: forced,
             });
         }
         self.0.borrow_mut().request_frame = callback;
+    }
+
+    /// Make the next tick produce a frame even if nothing in the scene changed.
+    pub(crate) fn force_next_frame(&self) {
+        self.0.borrow_mut().force_frame = true;
     }
 
     /// Match the consumer's display area.
@@ -230,24 +288,41 @@ impl EmbedWindow {
             state.pixels = (width, height);
 
             let state = &mut *state;
-            match SharedTexture::new(&state.devices, width, height) {
+            // Both targets, since `draw` alternates between them; a stale one at
+            // the old size would show up every other frame.
+            let allocated = (|| -> Result<[SharedTexture; 2]> {
+                Ok([
+                    SharedTexture::new(&state.devices, width, height)?,
+                    SharedTexture::new(&state.devices, width, height)?,
+                ])
+            })();
+            match allocated {
                 Ok(shared) => {
-                    match state.renderer.set_offscreen_target(
-                        shared.render_target_texture(),
-                        width,
-                        height,
-                    ) {
+                    match state
+                        .renderer
+                        .set_offscreen_target(shared[0].render_target_texture(), width, height)
+                    {
                         Ok(()) => {
+                            state.next_buffer = 0;
+                            // Freshly allocated targets are blank, and the scene
+                            // may be identical to the last one.
+                            state.force_frame = true;
                             // Null consumer: a detached window, so there is no
-                            // process to duplicate the new handle into and no
+                            // process to duplicate the new handles into and no
                             // handshake to send. Still reallocated and
                             // retargeted, so it keeps rendering correctly.
-                            let handle = if state.consumer_process.is_invalid() {
-                                Ok(0)
+                            let handles = if state.consumer_process.is_invalid() {
+                                Ok([0, 0])
                             } else {
-                                shared.share_with(state.consumer_process)
+                                shared[0]
+                                    .share_with(state.consumer_process)
+                                    .and_then(|first| {
+                                        shared[1]
+                                            .share_with(state.consumer_process)
+                                            .map(|second| [first, second])
+                                    })
                             };
-                            // The old target cannot simply be dropped here. Its
+                            // The old targets cannot simply be dropped here. Their
                             // D3D11 side is an 11on12 *wrapped* resource, and
                             // releasing one while the immediate context still has
                             // queued work referencing it faults inside the interop
@@ -258,11 +333,11 @@ impl EmbedWindow {
                             let previous = std::mem::replace(&mut state.shared, shared);
                             drop(previous);
                             log::info!("[zed-embed] resized to {width}x{height}");
-                            match handle {
-                                Ok(handle) => Some((handle, width, height)),
+                            match handles {
+                                Ok(handles) => Some((handles, width, height)),
                                 Err(error) => {
                                     log::error!(
-                                        "[zed-embed] re-sharing the resized target: {error:#}"
+                                        "[zed-embed] re-sharing the resized targets: {error:#}"
                                     );
                                     None
                                 }
@@ -275,16 +350,16 @@ impl EmbedWindow {
                     }
                 }
                 Err(error) => {
-                    log::error!("[zed-embed] reallocating the shared target: {error:#}");
+                    log::error!("[zed-embed] reallocating the shared targets: {error:#}");
                     None
                 }
             }
         };
 
-        if let Some((handle, width, height)) = reshared {
+        if let Some((handles, width, height)) = reshared {
             let mut callback = self.0.borrow_mut().reshare.take();
             if let Some(callback) = callback.as_mut() {
-                callback(handle, width, height);
+                callback(handles, width, height);
             }
             self.0.borrow_mut().reshare = callback;
         }
@@ -319,6 +394,9 @@ impl EmbedWindow {
                 (state.bounds.size, false)
             } else {
                 state.scale = scale;
+                // A scale change relays out the same content: the scene is
+                // "unchanged" as far as dirty-tracking goes, but every pixel is.
+                state.force_frame = true;
                 let (width, height) = state.pixels;
                 let size = Size {
                     width: px(width as f32 / scale),
@@ -365,6 +443,8 @@ impl EmbedWindow {
                 return;
             }
             state.activated = true;
+            // A consumer just became live; it has nothing to sample.
+            state.force_frame = true;
             (
                 state.active_status_change.take(),
                 state.hover_status_change.take(),
@@ -538,21 +618,44 @@ impl PlatformWindow for EmbedWindow {
         let mut state = self.0.borrow_mut();
         let state = &mut *state;
 
+        // Alternate targets so this frame never lands in the texture the
+        // consumer is still sampling. Rebinding is view-only (`bind_offscreen_target`),
+        // because the size has not changed.
+        let index = state.next_buffer;
+        if let Err(error) = state
+            .renderer
+            .bind_offscreen_target(state.shared[index].render_target_texture())
+        {
+            log::error!("[zed-embed] binding shared buffer {index}: {error:#}");
+            return;
+        }
+        state.next_buffer = 1 - index;
+
         // Acquire/release bracket every frame: releasing is what flushes the
         // 11on12 layer, and therefore what makes these pixels visible to the
         // consumer's D3D12 device.
-        state.shared.acquire(&state.devices);
+        state.shared[index].acquire(&state.devices);
         state
             .renderer
             .draw(scene, WindowBackgroundAppearance::Opaque)
             .log_err();
-        state.shared.release(&state.devices);
+        state.shared[index].release(&state.devices);
+
+        // Flush submits, it does not complete: without a value for the consumer
+        // to wait on, GTK samples whatever the GPU happens to have written so far.
+        let fence_value = match state.devices.signal_frame() {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("[zed-embed] signalling the frame fence: {error:#}");
+                return;
+            }
+        };
 
         // Pixels, not logical: the consumer samples a sub-rect of the shared
         // texture, which is sized in device pixels.
         let (width, height) = state.pixels;
         if let Some(callback) = state.on_frame.as_mut() {
-            callback(width, height);
+            callback(index, width, height, fence_value);
         }
     }
 

@@ -148,26 +148,44 @@ impl WindowsPlatform {
             consumer,
         )?;
 
-        let (handle, width, height) = window
+        let (handles, width, height) = window
             .share()
-            .context("Sharing the embed texture with the consumer")?;
+            .context("Sharing the embed textures with the consumer")?;
+        let fence = window
+            .share_fence()
+            .context("Sharing the frame fence with the consumer")?;
         // Mode byte first, then the handshake: that is the order the consumer
         // reads them in.
         crate::embed::send_mode(&session.pipe, true).context("Sending the transport mode")?;
-        crate::embed::send_handshake(&session.pipe, handle, width, height)
+        crate::embed::send_handshake(&session.pipe, handles[0], width, height)
             .context("Sending the embed handshake")?;
+        crate::embed::send_shared_extra(&session.pipe, handles[1], fence)
+            .context("Sending the second buffer and the frame fence")?;
 
         let pipe = session.pipe.clone();
-        window.set_on_frame(Box::new(move |width, height| {
-            if let Err(error) = crate::embed::send_ready(&pipe, width, height) {
+        window.set_on_frame(Box::new(move |index, width, height, fence_value| {
+            // Value first: the consumer applies the most recent one to the next
+            // `RDY!`, so sending it after would leave that frame unsynchronised.
+            if let Err(error) = crate::embed::send_fence_value(&pipe, fence_value) {
+                log::error!("[zed-embed] fence value failed: {error:#}");
+                return;
+            }
+            if let Err(error) = crate::embed::send_ready(&pipe, index as u32, width, height) {
                 log::error!("[zed-embed] frame notification failed: {error:#}");
             }
         }));
-        // A resize reallocates the target, so the consumer needs a new handle.
+        // A resize reallocates the targets, so the consumer needs new handles.
+        // The fence survives it, so it is not re-sent.
         let pipe = session.pipe.clone();
-        window.set_on_reshare(Box::new(move |handle, width, height| {
-            if let Err(error) = crate::embed::send_handshake(&pipe, handle, width, height) {
+        window.set_on_reshare(Box::new(move |handles, width, height| {
+            if let Err(error) = crate::embed::send_handshake(&pipe, handles[0], width, height) {
                 log::error!("[zed-embed] re-handshake after resize failed: {error:#}");
+                return;
+            }
+            // Fence 0: unchanged by the reallocation, so the consumer keeps the
+            // one it already holds.
+            if let Err(error) = crate::embed::send_shared_extra(&pipe, handles[1], 0) {
+                log::error!("[zed-embed] re-sharing the second buffer failed: {error:#}");
             }
         }));
         let pipe = session.pipe.clone();
@@ -179,14 +197,48 @@ impl WindowsPlatform {
 
         let receiver = crate::embed::spawn_reader(session.pipe.clone());
         let weak = window.downgrade();
-        let background = self.background_executor();
+        // The frame clock gets its OWN thread rather than `background.timer`.
+        //
+        // That timer runs on the shared background pool — the same pool a
+        // language server saturates. Idle, it ticked at 60Hz; with rust-analyzer
+        // working it fired late and by however much the pool was behind, which
+        // delayed not just frames but the input drain below, since both hang off
+        // this one await. That is why the embed collapsed to a few frames a second
+        // the moment the LSP started while the same binary in a native window
+        // stayed smooth: a native window's repaint is driven by the platform's
+        // vsync, which no amount of application work can starve.
+        //
+        // A plain sleeping thread cannot be starved by executor load. It only
+        // paces; the work still happens on the foreground task below, because
+        // GPUI requires it.
+        let (tick_tx, mut tick_rx) = futures::channel::mpsc::channel::<()>(0);
+        std::thread::Builder::new()
+            .name("zed-embed-frame-clock".into())
+            .spawn(move || {
+                // Bounded(1) + `try_send`: if the foreground is still busy with
+                // the previous frame, drop this tick instead of queuing a backlog
+                // to burn through once it catches up.
+                let mut tick_tx = tick_tx;
+                while !tick_tx.is_closed() {
+                    // `try_send` on a zero-capacity channel succeeds only when the
+                    // receiver is already waiting. A failure means the foreground
+                    // is still busy with the previous frame, and dropping the tick
+                    // rather than queuing it is the point: no backlog to burn
+                    // through once it catches up.
+                    let _ = tick_tx.try_send(());
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+            })
+            .ok();
         self.foreground_executor()
             .spawn(async move {
                 let mut input_state = crate::embed::EmbedInputState::default();
                 loop {
-                    // ~60Hz. The consumer has no way to request a frame, so the
-                    // session polls rather than waiting for damage.
-                    background.timer(Duration::from_millis(16)).await;
+                    // ~60Hz, paced by the thread above.
+                    use futures::StreamExt as _;
+                    if tick_rx.next().await.is_none() {
+                        break;
+                    }
                     let Some(window) = weak.upgrade() else {
                         break;
                     };
@@ -985,10 +1037,19 @@ impl Platform for WindowsPlatform {
         // writing to — the host owns the real system clipboard, so a copy is
         // forwarded there instead.
         if let Some(session) = self.embed.as_ref() {
-            if let Some(text) = item.text()
-                && let Err(error) = crate::embed::send_clipboard(&session.pipe, &text)
-            {
-                log::error!("[zed-embed] forwarding a copy to the host failed: {error:#}");
+            if let Some(text) = item.text() {
+                // Cache locally as well, exactly as the Linux headless path does.
+                // Forwarding alone is not enough: the host records the text
+                // before putting it on the system clipboard, precisely so the
+                // resulting `changed` signal does not echo back to us — which
+                // means nothing else ever populates the cache with our OWN copy,
+                // and `read_from_clipboard` (below) reads only the cache. Without
+                // this, copying inside the embed and pasting inside the embed
+                // yields whatever the host last pushed, or nothing at all.
+                *crate::embed::CLIPBOARD_CACHE.lock() = Some(text.clone());
+                if let Err(error) = crate::embed::send_clipboard(&session.pipe, &text) {
+                    log::error!("[zed-embed] forwarding a copy to the host failed: {error:#}");
+                }
             }
             return;
         }

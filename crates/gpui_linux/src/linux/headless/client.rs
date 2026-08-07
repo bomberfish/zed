@@ -49,6 +49,10 @@ enum EmbedInput {
         button: u8,
         pressed: bool,
     },
+    /// A modifier pressed or released on its own; carries the resulting state.
+    ModifiersChanged {
+        modifiers: Modifiers,
+    },
     Key {
         // Already-translated GPUI keystroke fields (the consumer owns the
         // keyval→name mapping, since it has GDK's tables).
@@ -106,16 +110,25 @@ fn read_embed_input(r: &mut impl Read) -> std::io::Result<EmbedInput> {
             let mut char_len = [0u8; 1];
             r.read_exact(&mut char_len)?;
             let key_char = read_length_prefixed(r, char_len[0] as usize)?;
+            let modifiers = Modifiers {
+                control: mods & MOD_CTRL != 0,
+                alt: mods & MOD_ALT != 0,
+                shift: mods & MOD_SHIFT != 0,
+                platform: mods & MOD_PLATFORM != 0,
+                function: false,
+            };
+            // Empty key name = a modifier pressed or released on its own. gpui
+            // models those as `ModifiersChanged`, not as a key: sending them as a
+            // KeyDown named `alt_l` matched no binding, so a bare Alt looked like
+            // it was never delivered. The length byte allows 0, so no new tag.
+            // Same contract as the Windows decoder — the consumer is shared.
+            if key.is_empty() {
+                return Ok(EmbedInput::ModifiersChanged { modifiers });
+            }
             Ok(EmbedInput::Key {
                 key,
                 key_char: (!key_char.is_empty()).then_some(key_char),
-                modifiers: Modifiers {
-                    control: mods & MOD_CTRL != 0,
-                    alt: mods & MOD_ALT != 0,
-                    shift: mods & MOD_SHIFT != 0,
-                    platform: mods & MOD_PLATFORM != 0,
-                    function: false,
-                },
+                modifiers,
                 pressed,
             })
         }
@@ -728,6 +741,14 @@ impl LinuxClient for HeadlessClient {
                                             )),
                                             modifiers: Modifiers::default(),
                                             touch_phase: TouchPhase::Moved,
+                                        },
+                                    ));
+                                }
+                                EmbedInput::ModifiersChanged { modifiers } => {
+                                    win.dispatch_input(PlatformInput::ModifiersChanged(
+                                        gpui::ModifiersChangedEvent {
+                                            modifiers,
+                                            capslock: gpui::Capslock { on: false },
                                         },
                                     ));
                                 }

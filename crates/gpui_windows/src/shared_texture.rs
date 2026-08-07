@@ -18,6 +18,8 @@
 //! would have forced the whole UI onto the Mesa-on-D3D12 adapter, since that is
 //! the only one here implementing `VK_KHR_external_memory_win32`.
 
+use std::cell::Cell;
+
 use anyhow::{Context as _, Result};
 use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, GENERIC_ALL, HANDLE};
 use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
@@ -32,8 +34,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_HEAP_FLAG_SHARED,
     D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC,
     D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12CreateDevice,
-    ID3D12CommandQueue, ID3D12Device, ID3D12Resource,
+    D3D12_FENCE_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET,
+    D3D12CreateDevice, ID3D12CommandQueue, ID3D12Device, ID3D12Fence, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -45,11 +47,28 @@ use windows::core::Interface;
 /// `device`/`device_context` exactly as it would a normally-created pair.
 pub(crate) struct SharedTextureDevices {
     pub(crate) d3d12_device: ID3D12Device,
-    /// 11on12 needs a queue to submit the D3D11 work it translates.
-    pub(crate) _command_queue: ID3D12CommandQueue,
+    /// 11on12 needs a queue to submit the D3D11 work it translates — and since
+    /// every frame's work lands here, this is also what a frame-completion fence
+    /// must be signalled on.
+    pub(crate) command_queue: ID3D12CommandQueue,
     pub(crate) d3d11on12: ID3D11On12Device,
     pub(crate) device: ID3D11Device,
     pub(crate) device_context: ID3D11DeviceContext,
+    /// Frame-completion fence, shared with the consumer.
+    ///
+    /// `Flush()` only *submits* the frame's commands; it does not wait for the
+    /// GPU. Without something for the consumer to wait on, `GdkD3D12Texture`
+    /// samples the resource whenever GTK next paints — mid-render, which reads as
+    /// horizontal tearing, or mid-clear, which reads as a flash to white. GTK
+    /// takes exactly this pair (`gdk_d3d12_texture_builder_set_fence` /
+    /// `_set_fence_wait`), so the producer signals a monotonic value per frame
+    /// and sends it alongside `RDY!`.
+    fence: ID3D12Fence,
+    /// NT handle for `fence`, duplicated into the consumer at handshake time.
+    fence_handle: HANDLE,
+    /// Value signalled for the most recent frame. Monotonic; never reset, so a
+    /// stale wait can only ever be already-satisfied rather than deadlock.
+    fence_value: Cell<u64>,
 }
 
 impl SharedTextureDevices {
@@ -97,13 +116,68 @@ impl SharedTextureDevices {
             .cast::<ID3D11On12Device>()
             .context("casting the 11on12 device")?;
 
+        let fence: ID3D12Fence = unsafe {
+            d3d12_device.CreateFence(0, D3D12_FENCE_FLAG_SHARED)
+        }
+        .context("CreateFence for the embed frame-completion fence")?;
+        let fence_handle = unsafe {
+            d3d12_device.CreateSharedHandle(&fence, None, GENERIC_ALL.0, None)
+        }
+        .context("CreateSharedHandle for the embed frame-completion fence")?;
+
         Ok(Self {
             d3d12_device,
-            _command_queue: command_queue,
+            command_queue,
             d3d11on12,
             device,
             device_context,
+            fence,
+            fence_handle,
+            fence_value: Cell::new(0),
         })
+    }
+
+    /// Signal the next fence value on the queue the frame was submitted to, and
+    /// return it for the consumer to wait on.
+    ///
+    /// Called after the frame's `release` (which flushes), so the signal is
+    /// ordered behind that frame's work and in front of anything the next frame
+    /// submits.
+    pub(crate) fn signal_frame(&self) -> Result<u64> {
+        let value = self.fence_value.get() + 1;
+        unsafe { self.command_queue.Signal(&self.fence, value) }
+            .context("signalling the embed frame-completion fence")?;
+        self.fence_value.set(value);
+        Ok(value)
+    }
+
+    /// Duplicate the fence handle into the consumer process. Same reasoning as
+    /// [`SharedTexture::share_with`]: an NT handle is process-local.
+    pub(crate) fn share_fence_with(&self, consumer_process: HANDLE) -> Result<isize> {
+        let mut duplicate = HANDLE::default();
+        unsafe {
+            windows::Win32::Foundation::DuplicateHandle(
+                GetCurrentProcess(),
+                self.fence_handle,
+                consumer_process,
+                &mut duplicate,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .context("duplicating the frame-completion fence handle into the consumer")?;
+        Ok(duplicate.0 as isize)
+    }
+}
+
+impl Drop for SharedTextureDevices {
+    fn drop(&mut self) {
+        if !self.fence_handle.is_invalid()
+            && let Err(error) = unsafe { CloseHandle(self.fence_handle) }
+        {
+            log::error!("[zed-embed] closing the fence handle failed: {error:#}");
+        }
     }
 }
 

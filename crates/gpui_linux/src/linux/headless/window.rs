@@ -60,6 +60,14 @@ struct HeadlessWindowState {
     // frames/input over IPC instead of discarding everything.
     renderer: Option<EmbedRenderer>,
     request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
+    /// Force the next frame even when GPUI considers the window clean.
+    ///
+    /// The tick used to force EVERY frame, so an idle embed rebuilt and
+    /// rasterized the whole scene at the consumer's tick rate while a native
+    /// window idles at zero. Dirty-tracking handles the scene; this covers the
+    /// cases where the OUTPUT changed without it — a consumer that just attached
+    /// has no pixels, and a resize reallocates the buffers.
+    force_frame: bool,
     input: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     resize: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     // Fired when the host connection drops so GPUI removes this window.
@@ -151,6 +159,8 @@ impl HeadlessWindow {
             is_fullscreen: false,
             renderer: None,
             request_frame: None,
+            // The first frame always happens: a fresh consumer has nothing.
+            force_frame: true,
             input: None,
             resize: None,
             close: None,
@@ -177,6 +187,8 @@ impl HeadlessWindow {
             is_fullscreen: false,
             renderer: Some(renderer),
             request_frame: None,
+            // The first frame always happens: a fresh consumer has nothing.
+            force_frame: true,
             input: None,
             resize: None,
             close: None,
@@ -190,14 +202,23 @@ impl HeadlessWindow {
     /// Ask GPUI to produce + present a frame (drives `draw`). Called from the
     /// embed frame clock.
     pub(crate) fn tick_frame(&self) {
+        let forced = {
+            let mut state = self.0.borrow_mut();
+            std::mem::replace(&mut state.force_frame, false)
+        };
         let mut cb = self.0.borrow_mut().request_frame.take();
         if let Some(cb) = cb.as_mut() {
             cb(RequestFrameOptions {
-                require_presentation: true,
-                force_render: true,
+                require_presentation: forced,
+                force_render: forced,
             });
         }
         self.0.borrow_mut().request_frame = cb;
+    }
+
+    /// Make the next tick produce a frame even if the scene did not change.
+    pub(crate) fn force_next_frame(&self) {
+        self.0.borrow_mut().force_frame = true;
     }
 
     /// Resize the embed surface to match the consumer's display area: resize the
@@ -213,6 +234,8 @@ impl HeadlessWindow {
                 return;
             }
             state.bounds.size = size;
+            // The reallocated buffers are blank even if the scene is identical.
+            state.force_frame = true;
             if let Some(renderer) = state.renderer.as_mut() {
                 renderer.resize_offscreen(width, height);
             }
@@ -264,6 +287,8 @@ impl HeadlessWindow {
                 return;
             }
             state.activated = true;
+            // A consumer just became live; it has nothing to sample.
+            state.force_frame = true;
             (
                 state.active_status_change.take(),
                 state.hover_status_change.take(),
