@@ -454,6 +454,53 @@ pub(crate) fn send_ready(pipe: &EmbedPipe, index: u32, width: u32, height: u32) 
     pipe.write_all(&payload)
 }
 
+/// Cursor style change: `CURS` + u8 name length + CSS name, byte-identical to
+/// the Linux producer's. The consumer resolves it with `gdk::Cursor::from_name`.
+pub(crate) fn send_cursor(pipe: &EmbedPipe, name: &str) -> Result<()> {
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(64);
+    let mut payload = Vec::with_capacity(5 + len);
+    payload.extend_from_slice(b"CURS");
+    payload.push(len as u8);
+    payload.extend_from_slice(&bytes[..len]);
+    pipe.write_all(&payload)
+}
+
+/// The cursor the most recent `set_cursor_style` asked for.
+///
+/// GPUI sets the cursor several times per paint — a default reset, then the
+/// hovered element's real one — so forwarding every call would put a burst of
+/// `CURS` messages on the pipe per frame. The latest wins; the frame pump flushes
+/// it once per tick. Same design as the Linux producer.
+pub(crate) static PENDING_CURSOR: Mutex<Option<&'static str>> = Mutex::new(None);
+
+/// Map a GPUI cursor style to the CSS name the consumer resolves. Kept in step
+/// with the Linux producer's table so both embeds show the same pointer.
+pub(crate) fn cursor_name(style: gpui::CursorStyle) -> &'static str {
+    use gpui::CursorStyle::*;
+    match style {
+        Arrow => "default",
+        IBeam => "text",
+        Crosshair => "crosshair",
+        ClosedHand => "grabbing",
+        OpenHand => "grab",
+        PointingHand => "pointer",
+        ResizeLeft => "w-resize",
+        ResizeRight => "e-resize",
+        ResizeLeftRight => "ew-resize",
+        ResizeUp => "n-resize",
+        ResizeDown => "s-resize",
+        ResizeUpDown => "ns-resize",
+        ResizeUpLeftDownRight => "nwse-resize",
+        ResizeUpRightDownLeft => "nesw-resize",
+        ResizeColumn => "col-resize",
+        ResizeRow => "row-resize",
+        IBeamCursorForVerticalLayout => "vertical-text",
+        OperationNotAllowed => "not-allowed",
+        _ => "default",
+    }
+}
+
 pub(crate) fn send_title(pipe: &EmbedPipe, title: &str) -> Result<()> {
     let bytes = title.as_bytes();
     let len = bytes.len().min(1024);

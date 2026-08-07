@@ -196,6 +196,7 @@ impl WindowsPlatform {
         }));
 
         let receiver = crate::embed::spawn_reader(session.pipe.clone());
+        let cursor_pipe = session.pipe.clone();
         let weak = window.downgrade();
         // The frame clock gets its OWN thread rather than `background.timer`.
         //
@@ -233,6 +234,7 @@ impl WindowsPlatform {
         self.foreground_executor()
             .spawn(async move {
                 let mut input_state = crate::embed::EmbedInputState::default();
+                let mut last_cursor: Option<&'static str> = None;
                 loop {
                     // ~60Hz, paced by the thread above.
                     use futures::StreamExt as _;
@@ -253,6 +255,18 @@ impl WindowsPlatform {
                                 log::info!("[zed-embed] consumer disconnected; closing");
                                 window.close();
                                 return;
+                            }
+                        }
+                    }
+                    // Whatever this tick's layout asked for, at most one message.
+                    let pending = crate::embed::PENDING_CURSOR.lock().take();
+                    if let Some(name) = pending
+                        && last_cursor != Some(name)
+                    {
+                        match crate::embed::send_cursor(&cursor_pipe, name) {
+                            Ok(()) => last_cursor = Some(name),
+                            Err(error) => {
+                                log::error!("[zed-embed] cursor update failed: {error:#}")
                             }
                         }
                     }
@@ -992,6 +1006,14 @@ impl Platform for WindowsPlatform {
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
+        // In an embed session there is no window of ours for a Win32 cursor to
+        // apply to — the pointer is over the CONSUMER's widget, so the cursor has
+        // to travel with the frames. Stash it; the frame pump flushes the latest
+        // once per tick (GPUI calls this several times per paint).
+        if self.embed.is_some() {
+            *crate::embed::PENDING_CURSOR.lock() = Some(crate::embed::cursor_name(style));
+            return;
+        }
         let hcursor = load_cursor(style);
         if self.inner.state.current_cursor.get().map(|c| c.0) != hcursor.map(|c| c.0) {
             self.post_message(
