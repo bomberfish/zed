@@ -179,7 +179,9 @@ impl MetalRenderer {
     ///
     /// This renderer can render scenes to images without requiring a CAMetalLayer,
     /// window, or AppKit. Use `render_scene_to_image()` to render scenes.
-    #[cfg(any(test, feature = "test-support"))]
+    ///
+    /// Not test-only: embed sessions render this way in production, into a texture
+    /// they hand to the host process (see [`crate::embed_window`]).
     pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
         let device = Self::create_device();
         Self::new_internal(device, None, true, instance_buffer_pool)
@@ -369,6 +371,13 @@ impl MetalRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
+    }
+
+    /// The device this renderer draws with. An embed session allocates its own
+    /// render targets and must allocate them on the same device, or
+    /// `draw_primitives_to_texture` fails at encode time.
+    pub(crate) fn device(&self) -> &metal::Device {
+        &self.device
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
@@ -748,8 +757,6 @@ impl MetalRenderer {
             anyhow::bail!("Invalid size for render_scene: {:?}", size);
         }
 
-        self.update_path_intermediate_textures(size);
-
         let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
             texture.width() != size.width.0 as u64 || texture.height() != size.height.0 as u64
         });
@@ -769,6 +776,30 @@ impl MetalRenderer {
             .clone()
             .expect("just ensured the render target exists");
 
+        self.render_scene_to_target(scene, size, &target_texture, false, None)
+    }
+
+    /// Renders a scene into a caller-owned texture.
+    ///
+    /// `wait_for_completion` blocks until the GPU is done, which is what a caller
+    /// about to `get_bytes` the result needs. A caller handing the texture to
+    /// another process passes false and an `on_complete` instead: it runs on a
+    /// Metal driver thread once the frame is actually finished, which is the only
+    /// moment at which telling the consumer to sample is not a race.
+    pub(crate) fn render_scene_to_target(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        target_texture: &metal::TextureRef,
+        wait_for_completion: bool,
+        mut on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<()> {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            anyhow::bail!("Invalid size for render_scene_to_target: {:?}", size);
+        }
+
+        self.update_path_intermediate_textures(size);
+
         loop {
             let mut instance_buffer = self
                 .instance_buffer_pool
@@ -776,23 +807,45 @@ impl MetalRenderer {
                 .acquire(&self.device, self.is_unified_memory);
 
             let command_buffer =
-                self.draw_primitives_to_texture(scene, &mut instance_buffer, &target_texture, size);
+                self.draw_primitives_to_texture(scene, &mut instance_buffer, target_texture, size);
 
             match command_buffer {
                 Ok(command_buffer) => {
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
+                    // `Cell` because a block has to be callable more than once
+                    // even though Metal calls this one exactly once, so neither
+                    // payload can simply be moved out of the closure.
+                    let on_complete = Cell::new(on_complete.take());
                     let block = ConcreteBlock::new(move |_| {
                         if let Some(instance_buffer) = instance_buffer.take() {
                             instance_buffer_pool.lock().release(instance_buffer);
+                        }
+                        if let Some(on_complete) = on_complete.take() {
+                            on_complete();
                         }
                     });
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
 
-                    // Commit without waiting, mirroring presentation to a real
-                    // window where the CPU doesn't block on the GPU.
+                    // On discrete GPUs (non-unified memory), Managed textures
+                    // require an explicit blit synchronize before anything
+                    // outside this device sees the rendered data: the CPU about
+                    // to `get_bytes` it, or — for an IOSurface target — the
+                    // consumer process compositing it. Without this, the first
+                    // reads stale zeros and the second shows a stale frame.
+                    if !self.is_unified_memory {
+                        let blit = command_buffer.new_blit_command_encoder();
+                        blit.synchronize_resource(target_texture);
+                        blit.end_encoding();
+                    }
+
                     command_buffer.commit();
+                    if wait_for_completion {
+                        command_buffer.wait_until_completed();
+                    }
+                    // Otherwise the CPU does not block on the GPU here, mirroring
+                    // presentation to a real window.
                     return Ok(());
                 }
                 Err(err) => {
@@ -1581,6 +1634,16 @@ fn new_command_encoder_for_texture<'a>(
     color_attachment.set_texture(Some(texture));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
     configure_color_attachment(color_attachment);
+
+    // Confine the pass to the part of the attachment the viewport covers. For a
+    // window's drawable those are the same thing and this changes nothing, but an
+    // embed session renders into the top-left of a surface allocated once at
+    // 3840x2160 (see `iosurface::embed_max_size`), and load/store actions are
+    // per-attachment rather than per-viewport: without this, every frame clears and
+    // writes back 33MB whatever the pane's size, which on a 120Hz display is
+    // gigabytes a second of memory traffic for pixels nothing samples.
+    render_pass_descriptor.set_render_target_width(i32::from(viewport_size.width).max(1) as u64);
+    render_pass_descriptor.set_render_target_height(i32::from(viewport_size.height).max(1) as u64);
 
     let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
     command_encoder.set_viewport(metal::MTLViewport {

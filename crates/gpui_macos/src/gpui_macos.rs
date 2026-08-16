@@ -7,7 +7,10 @@
 mod dispatcher;
 mod display;
 mod display_link;
+mod embed;
+mod embed_window;
 mod events;
+mod iosurface;
 mod keyboard;
 mod pasteboard;
 mod system_notifications;

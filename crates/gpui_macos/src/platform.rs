@@ -1,13 +1,20 @@
 use crate::{
     BoolExt, MacDispatcher, MacDisplay, MacKeyboardLayout, MacKeyboardMapper, MacWindow,
-    events::key_to_native, ns_string, pasteboard::Pasteboard, renderer,
-    set_active_window_cursor_style,
+    embed::EmbedSocket,
+    embed_window::{EmbedDisplay, EmbedWindow},
+    events::key_to_native,
+    ns_string,
+    pasteboard::Pasteboard,
+    renderer, set_active_window_cursor_style,
 };
 use anyhow::{Context as _, anyhow};
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
-        NSApplication, NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular,
+        NSApplication,
+        NSApplicationActivationPolicy::{
+            NSApplicationActivationPolicyAccessory, NSApplicationActivationPolicyRegular,
+        },
         NSControl as _, NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel,
         NSSavePanel, NSVisualEffectState, NSVisualEffectView, NSWindow,
     },
@@ -24,6 +31,7 @@ use core_foundation::{
     runloop::CFRunLoopRun,
     string::{CFString, CFStringRef},
 };
+use core_graphics::display::CGDirectDisplayID;
 use ctor::ctor;
 use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
@@ -49,7 +57,7 @@ use semver::Version;
 use std::{
     cell::Cell,
     ffi::{CStr, OsStr, c_void},
-    os::{raw::c_char, unix::ffi::OsStrExt},
+    os::{raw::c_char, unix::ffi::OsStrExt, unix::net::UnixStream},
     path::{Path, PathBuf},
     ptr,
     rc::Rc,
@@ -58,6 +66,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 #[allow(non_upper_case_globals)]
@@ -190,6 +199,16 @@ pub(crate) struct MacPlatformState {
     /// Mirrors `[NSCursor setHiddenUntilMouseMoves:]` state, which AppKit doesn't expose.
     cursor_visible: Arc<AtomicBool>,
     system_notifications: crate::system_notifications::SystemNotificationState,
+    /// Set when this process was started to serve an embed socket: windows bind to
+    /// consumer connections instead of opening an `NSWindow`, and the cursor and
+    /// pasteboard travel over those connections rather than to AppKit.
+    embedding: bool,
+    /// The consumer that owns the pasteboard bridge: the most recently bound one.
+    ///
+    /// One embed process serves every pane the host opens, and there is only one
+    /// system clipboard to bridge to, so the newest pane wins — which is also the
+    /// pane the user just interacted with. Linux has the same single global writer.
+    embed_clipboard: Option<Arc<EmbedSocket>>,
 }
 
 impl MacPlatform {
@@ -211,6 +230,23 @@ impl MacPlatform {
 
         let keyboard_layout = MacKeyboardLayout::new();
         let keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
+
+        // The listener starts here rather than lazily in `open_window`, because the
+        // order is the other way round: the host connects, the connection is
+        // accepted, and *that* is what makes a window open.
+        //
+        // No `headless` override, unlike Windows. There, embed mode has to force
+        // `headless` off because the flag means "no GPU, no DirectWrite" and an
+        // embed needs both. Here `headless` reaches this platform only from
+        // `gpui_platform::headless()`, which the embed launch path never calls, and
+        // `ZED_HEADLESS` is read on Linux/FreeBSD alone.
+        let embedding = match std::env::var(crate::embed::EMBED_ENDPOINT_VAR) {
+            Ok(socket_path) if !socket_path.is_empty() => {
+                crate::embed::ensure_embed_listener(&socket_path);
+                true
+            }
+            _ => false,
+        };
 
         Self(Mutex::new(MacPlatformState {
             headless,
@@ -237,7 +273,150 @@ impl MacPlatform {
             keyboard_mapper,
             cursor_visible: Arc::new(AtomicBool::new(true)),
             system_notifications: crate::system_notifications::SystemNotificationState::new(),
+            embedding,
+            embed_clipboard: None,
         }))
+    }
+
+    /// Bind a queued consumer to an offscreen window and run the session: frames
+    /// out on a fixed clock, forwarded input in, until either side goes away.
+    fn open_embed_window(
+        &self,
+        options: WindowParams,
+        socket: Arc<EmbedSocket>,
+        reader: UnixStream,
+    ) -> Box<dyn PlatformWindow> {
+        let (foreground_executor, renderer_context) = {
+            let mut guard = self.0.lock();
+            guard.embed_clipboard = Some(socket.clone());
+            (
+                guard.foreground_executor.clone(),
+                guard.renderer_context.clone(),
+            )
+        };
+
+        let display = Rc::new(EmbedDisplay::new()) as Rc<dyn PlatformDisplay>;
+        let window = EmbedWindow::new(options, display, renderer_context);
+
+        // Attempted before the mode byte goes out, because the byte has to state
+        // what actually happened: every step of the handoff (surface allocation,
+        // the Metal wrapping, the bootstrap registration) can fail on a machine
+        // where CPU frames still work, and the fallback has to be indistinguishable
+        // from a consumer that never asked for zero copy.
+        let zero_copy = std::env::var_os(crate::embed::EMBED_IOSURFACE_VAR).and_then(|_| {
+            window
+                .enable_zero_copy()
+                .inspect_err(|error| {
+                    log::error!(
+                        "[zed-embed] the IOSurface transport is unavailable, \
+                         falling back to CPU frames: {error:#}"
+                    )
+                })
+                .ok()
+        });
+
+        // The mode byte comes before anything else, because that is the order the
+        // consumer reads in. Mode 0 is CPU frames, which have no handshake to
+        // follow: the surface-passing transports announce themselves here instead.
+        if let Err(error) = crate::embed::send_mode(&socket, zero_copy.is_some()) {
+            log::error!("[zed-embed] sending the transport mode failed: {error:#}");
+        }
+
+        match zero_copy {
+            Some(handshake) => {
+                if let Err(error) = crate::embed::send_iosurface_handshake(
+                    &socket,
+                    &handshake.service_name,
+                    handshake.buffer_count,
+                    handshake.max_width,
+                    handshake.max_height,
+                ) {
+                    log::error!("[zed-embed] sending the IOSurface handshake failed: {error:#}");
+                }
+                window.set_on_ready(Arc::new({
+                    let socket = socket.clone();
+                    move |index, width, height| {
+                        if let Err(error) = crate::embed::send_ready(&socket, index, width, height)
+                        {
+                            log::error!(
+                                "[zed-embed] announcing a finished frame failed: {error:#}"
+                            );
+                        }
+                    }
+                }));
+            }
+            None => {
+                window.set_on_frame(Box::new({
+                    let socket = socket.clone();
+                    move |pixels, width, height| {
+                        if let Err(error) = crate::embed::send_frame(&socket, width, height, pixels)
+                        {
+                            log::error!("[zed-embed] sending a frame failed: {error:#}");
+                        }
+                    }
+                }));
+            }
+        }
+        window.set_on_title_change(Box::new({
+            let socket = socket.clone();
+            move |title| {
+                if let Err(error) = crate::embed::send_title(&socket, title) {
+                    log::error!("[zed-embed] title update failed: {error:#}");
+                }
+            }
+        }));
+
+        let receiver = crate::embed::spawn_reader(reader);
+        let weak = window.downgrade();
+        let (tick_tx, mut tick_rx) = futures::channel::mpsc::channel::<()>(0);
+        spawn_embed_frame_clock(tick_tx);
+
+        foreground_executor
+            .spawn(async move {
+                use futures::StreamExt as _;
+
+                let mut input_state = crate::embed::EmbedInputState::default();
+                let mut last_cursor: Option<&'static str> = None;
+                loop {
+                    if tick_rx.next().await.is_none() {
+                        break;
+                    }
+                    let Some(window) = weak.upgrade() else {
+                        break;
+                    };
+                    window.ensure_active();
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(input) => {
+                                input_state.apply(input, &window);
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                log::info!("[zed-embed] consumer disconnected; closing");
+                                socket.shutdown();
+                                window.close();
+                                return;
+                            }
+                        }
+                    }
+                    // Whatever this tick's layout asked for, at most one message.
+                    let pending = crate::embed::PENDING_CURSOR.lock().take();
+                    if let Some(name) = pending
+                        && last_cursor != Some(name)
+                    {
+                        match crate::embed::send_cursor(&socket, name) {
+                            Ok(()) => last_cursor = Some(name),
+                            Err(error) => {
+                                log::error!("[zed-embed] cursor update failed: {error:#}")
+                            }
+                        }
+                    }
+                    window.tick_frame();
+                }
+            })
+            .detach();
+
+        Box::new(window)
     }
 
     unsafe fn create_menu_bar(
@@ -647,6 +826,22 @@ impl Platform for MacPlatform {
         // gpui's in-window popovers.
         if let WindowKind::AnchoredPopup(_) = options.kind {
             return Err(PopupNotSupportedError.into());
+        }
+
+        // An embed window replaces the native one outright: no `NSWindow`, and its
+        // pixels go to whichever consumer connected over the embed socket. Windows
+        // claims its single pipe with a flag; here each pane is its own connection
+        // on one shared listener, as on Linux, so the only question is whether one
+        // is waiting. Zed also opens windows of its own accord — settings being the
+        // obvious one — and those still want a real window.
+        let embedding = self.0.lock().embedding;
+        if embedding {
+            match crate::embed::take_pending_connection() {
+                Some((socket, reader)) => {
+                    return Ok(self.open_embed_window(options, Arc::new(socket), reader));
+                }
+                None => log::info!("[zed-embed] no consumer queued; opening a native window"),
+            }
         }
 
         let (cursor_visible, foreground_executor, background_executor, renderer_context) = {
@@ -1060,6 +1255,14 @@ impl Platform for MacPlatform {
     /// Match cursor style to one of the styles available
     /// in macOS's [NSCursor](https://developer.apple.com/documentation/appkit/nscursor).
     fn set_cursor_style(&self, style: CursorStyle) {
+        // There is no `NSWindow` to hit-test in an embed session, and the pointer the
+        // user sees belongs to the host's window: record the name instead, and let
+        // the frame clock forward at most one per tick. Setting `NSCursor` here would
+        // change the cursor of a process that has nothing on screen.
+        if self.0.lock().embedding {
+            *crate::embed::PENDING_CURSOR.lock() = Some(crate::embed::cursor_name(style));
+            return;
+        }
         unsafe {
             set_active_window_cursor_style(style);
         }
@@ -1090,13 +1293,47 @@ impl Platform for MacPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
+        // Paste takes what the host last pushed, so it sees the clipboard of the
+        // machine the user is typing on. Unlike the Linux and Windows producers this
+        // process could reach a real pasteboard — it is a full GUI process — but the
+        // pasteboard it would reach belongs to whichever machine the daemon spawned
+        // it on, which for a remote session is not the user's.
         let state = self.0.lock();
+        if state.embedding {
+            return crate::embed::CLIPBOARD_CACHE
+                .lock()
+                .clone()
+                .map(ClipboardItem::new_string);
+        }
         state.general_pasteboard.read()
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        let state = self.0.lock();
-        state.general_pasteboard.write(item);
+        let embed_clipboard = {
+            let state = self.0.lock();
+            if !state.embedding {
+                state.general_pasteboard.write(item);
+                return;
+            }
+            state.embed_clipboard.clone()
+        };
+        let Some(text) = item.text() else {
+            return;
+        };
+        // Cached as well as forwarded, exactly as the other two producers do it.
+        // Forwarding alone is not enough: the host records the text before putting it
+        // on the system clipboard, precisely so the resulting change notification
+        // does not echo back here — which means nothing else ever puts our OWN copy
+        // in the cache, and `read_from_clipboard` above reads only the cache. Without
+        // this, copying inside the embed and pasting inside it yields whatever the
+        // host last pushed.
+        *crate::embed::CLIPBOARD_CACHE.lock() = Some(text.clone());
+        let Some(socket) = embed_clipboard else {
+            return;
+        };
+        if let Err(error) = crate::embed::send_clipboard(&socket, &text) {
+            log::error!("[zed-embed] forwarding a copy to the host failed: {error:#}");
+        }
     }
 
     fn read_from_find_pasteboard(&self) -> Option<ClipboardItem> {
@@ -1215,6 +1452,226 @@ impl Platform for MacPlatform {
     }
 }
 
+/// What an embed session's frames are paced by, and what the tick carries.
+///
+/// The clock is deliberately not `background_executor.timer`. That timer runs on
+/// the shared background pool — the same pool a language server saturates — so
+/// with rust-analyzer working it fires however late the pool is behind, which
+/// delays not just frames but the input drain, since both hang off one await.
+/// That is what collapsed the embed to a few frames a second the moment the LSP
+/// started, while the same binary in a native window stayed smooth.
+struct EmbedFrameClock {
+    ticks: futures::channel::mpsc::Sender<()>,
+    /// The vsync subscription, kept so the clock can unsubscribe itself once the
+    /// session is gone. `None` on a machine where the display link would not
+    /// start, where [`spawn_embed_frame_clock`] falls back to a sleeping thread.
+    frames: Option<crate::WindowFrameSource>,
+    /// Which display the subscription above is on, so
+    /// [`retarget_embed_frame_clock`] can tell a real move from the consumer
+    /// re-stating where it already is.
+    display: Option<CGDirectDisplayID>,
+}
+
+thread_local! {
+    /// The live embed session's clock, for [`retarget_embed_frame_clock`].
+    ///
+    /// One per process because one process serves one embed session — `EmbedSession`
+    /// is claimed by the first `open_window` and every later window opens normally —
+    /// and thread-local because the pointer is only ever touched on the main thread:
+    /// `spawn_embed_frame_clock` runs there from `open_window`, the tick handler is
+    /// on the main queue, and the input drain that retargets is a
+    /// `foreground_executor` task.
+    static EMBED_FRAME_CLOCK: Cell<*mut EmbedFrameClock> =
+        const { Cell::new(ptr::null_mut()) };
+}
+
+/// Move an embed session's frame pacing onto `display_id`, the display the consumer
+/// says the pane is actually on.
+///
+/// The consumer is the only side that knows: a producer window is offscreen, so it
+/// is on no `NSScreen` at all. Without this the clock stays on whatever
+/// `CGMainDisplayID()` returned when the session started, which on a laptop driving
+/// an external panel is the wrong display in the expensive direction — a 120Hz
+/// built-in pacing a pane shown at 240Hz gives the user half the frames the panel
+/// could draw, and with the lid shut it names a display that is switched off.
+///
+/// Cheap to call repeatedly: the consumer sends this on attach and on every screen
+/// change, and a repeat of the current display returns without touching the
+/// registry.
+pub(crate) fn retarget_embed_frame_clock(display_id: u32) {
+    let display_id = display_id as CGDirectDisplayID;
+    let clock = EMBED_FRAME_CLOCK.get();
+    if clock.is_null() {
+        return;
+    }
+    // SAFETY: the pointer is the clock leaked by `spawn_embed_frame_clock`, which is
+    // never freed, and this thread-local is only read on the thread that set it —
+    // the same main thread the tick handler runs on, so there is no concurrent
+    // borrow.
+    let clock = unsafe { &mut *clock };
+    if clock.display == Some(display_id) {
+        return;
+    }
+    let Some(frames) = clock.frames.as_mut() else {
+        // The display link never started, so frames are on the fallback timer and
+        // there is no subscription to move. Said once per move rather than silently,
+        // because it means the pacing the consumer just asked for is not happening.
+        log::info!(
+            "[zed-embed] consumer is on display {display_id} but frames are on the \
+             fallback timer, so pacing cannot follow it"
+        );
+        return;
+    };
+    match frames.start(display_id) {
+        Ok(()) => {
+            clock.display = Some(display_id);
+            log::info!(
+                "[zed-embed] pacing frames on display {display_id} at {}",
+                describe_refresh_rate(display_id)
+            );
+        }
+        Err(error) => {
+            // The old subscription is gone either way — `start` stops before it
+            // subscribes — so this leaves the session with no vsync rather than the
+            // previous display's. Recovering onto the display it came from is worth
+            // the second attempt; if that fails too there is nothing left to try.
+            log::error!("[zed-embed] could not pace on display {display_id}: {error:#}");
+            if let Some(previous) = clock.display
+                && frames.start(previous).is_err()
+            {
+                clock.display = None;
+            }
+        }
+    }
+}
+
+/// A display's refresh rate as a log line: `"240Hz"`, or `"a variable rate"` for the
+/// zero CoreGraphics reports for ProMotion and other adaptive-sync panels.
+///
+/// Only ever logged. It is here because the whole question that prompted the
+/// consumer telling us its display — "it might be doing 120? i cant tell" — was
+/// unanswerable from either side's logs.
+fn describe_refresh_rate(display_id: CGDirectDisplayID) -> String {
+    // SAFETY: `CGDisplayCopyDisplayMode` takes an id and returns either null or a
+    // mode this owns, released below. Both calls are documented as safe on any
+    // thread.
+    unsafe {
+        let mode = core_graphics::display::CGDisplayCopyDisplayMode(display_id);
+        if mode.is_null() {
+            return "an unknown rate".to_string();
+        }
+        let hertz = core_graphics::display::CGDisplayModeGetRefreshRate(mode);
+        core_graphics::display::CGDisplayModeRelease(mode);
+        if hertz <= 0.0 {
+            "a variable rate".to_string()
+        } else {
+            format!("{hertz:.0}Hz")
+        }
+    }
+}
+
+impl EmbedFrameClock {
+    /// Offer a tick, and report whether the session is still listening.
+    ///
+    /// `try_send` on a zero-capacity channel succeeds only when the receiver is
+    /// already waiting. A full channel means the foreground is still busy with the
+    /// previous frame, and dropping the tick rather than queueing it is the point:
+    /// no backlog to burn through once it catches up.
+    fn tick(&mut self) -> bool {
+        match self.ticks.try_send(()) {
+            Err(error) if error.is_disconnected() => false,
+            _ => true,
+        }
+    }
+}
+
+/// Pace an embed session's frames on the vsync of the main display, the way a
+/// native window's repaint is paced.
+///
+/// A fixed 16ms sleep used to stand in for this, which capped the embed at 60fps
+/// and — worse on a variable-refresh panel — beat against the real vsync, so
+/// trackpad scrolling on a 120Hz display juddered while the same editor in a
+/// native window did not.
+///
+/// The main display only as an opening guess, because an offscreen window is on no
+/// screen at all. It is a poor guess on a laptop driving an external panel — and
+/// wrong in the expensive direction, not the harmless one, since a display slower
+/// than the one the pane is on costs frames the consumer can never get back. The
+/// consumer corrects it with a `Display` message as soon as it attaches; see
+/// [`retarget_embed_frame_clock`].
+fn spawn_embed_frame_clock(ticks: futures::channel::mpsc::Sender<()>) {
+    let clock = Box::into_raw(Box::new(EmbedFrameClock {
+        ticks,
+        frames: None,
+        display: None,
+    }));
+    EMBED_FRAME_CLOCK.set(clock);
+    // SAFETY: `clock` was just allocated here and nothing else refers to it. The
+    // dispatch source below targets the main queue, so `embed_frame_clock_tick`
+    // runs serially on this thread and is the only other reader.
+    let clock = unsafe { &mut *clock };
+    let mut frames = crate::WindowFrameSource::new(
+        clock as *mut EmbedFrameClock as *mut c_void,
+        embed_frame_clock_tick,
+    );
+    let display_id = unsafe { core_graphics::display::CGMainDisplayID() };
+    match frames.start(display_id) {
+        Ok(()) => {
+            log::info!(
+                "[zed-embed] pacing frames on the main display {display_id} at {} until the \
+                 consumer says which display the pane is on",
+                describe_refresh_rate(display_id)
+            );
+            clock.frames = Some(frames);
+            clock.display = Some(display_id);
+        }
+        Err(error) => {
+            log::error!(
+                "[zed-embed] the display link would not start, pacing frames on a \
+                 timer instead: {error:#}"
+            );
+            // A plain sleeping thread cannot be starved by executor load either. It
+            // paces at the slowest refresh worth calling smooth rather than at a
+            // guess about this machine's panel, since nothing here can ask.
+            let mut ticks = clock.ticks.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("zed-embed-frame-clock".into())
+                .spawn(move || {
+                    loop {
+                        if let Err(error) = ticks.try_send(())
+                            && error.is_disconnected()
+                        {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(16));
+                    }
+                })
+            {
+                log::error!("[zed-embed] spawning the frame clock failed: {error}");
+            }
+        }
+    }
+}
+
+/// One vsync on the main display, delivered on the main queue.
+extern "C" fn embed_frame_clock_tick(context: *mut c_void) {
+    // SAFETY: `context` is the `EmbedFrameClock` leaked by
+    // `spawn_embed_frame_clock`, which outlives every tick, and the dispatch
+    // source carrying it runs its handler serially on the main queue.
+    let clock = unsafe { &mut *(context as *mut EmbedFrameClock) };
+    if clock.tick() {
+        return;
+    }
+    // The session is over. Unsubscribing from inside the handler is safe — it only
+    // takes the registry lock, which is what the main thread is supposed to do, and
+    // the source itself stays alive because the clock is leaked — and it is worth
+    // doing, since otherwise a closed embed would keep waking the main thread once
+    // per vsync for as long as the process lives.
+    if let Some(frames) = clock.frames.as_mut() {
+        frames.stop();
+    }
+}
+
 unsafe fn path_from_objc(path: id) -> PathBuf {
     let len = msg_send![path, lengthOfBytesUsingEncoding: NSUTF8StringEncoding];
     let bytes = unsafe { path.UTF8String() as *const u8 };
@@ -1250,7 +1707,16 @@ extern "C" fn will_finish_launching(_this: &mut Object, _: Sel, _: id) {
 extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
     unsafe {
         let app: id = msg_send![APP_CLASS, sharedApplication];
-        app.setActivationPolicy_(NSApplicationActivationPolicyRegular);
+        // An embed session has nothing of its own on screen: Regular would put a
+        // second Dock icon beside the host's and take focus off it at launch.
+        // Accessory rather than Prohibited, because Zed still opens ordinary windows
+        // in an embed session (settings, for one) and those have to be activatable.
+        let activation_policy = if std::env::var_os(crate::embed::EMBED_ENDPOINT_VAR).is_some() {
+            NSApplicationActivationPolicyAccessory
+        } else {
+            NSApplicationActivationPolicyRegular
+        };
+        app.setActivationPolicy_(activation_policy);
 
         let notification_center: *mut Object =
             msg_send![class!(NSNotificationCenter), defaultCenter];

@@ -682,6 +682,12 @@ nucleo = "0.5"
 num-format = "0.4.4"
 objc = "0.2"
 objc2 = "0.6"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+    "std",
+] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSButton",
     "NSControl",
@@ -714,6 +720,12 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSURL",
     "NSUndoManager",
     "NSValue",
+    "objc2-core-foundation",
+    "std",
+] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = [
+    "IOSurfaceRef",
+    "libc",
     "objc2-core-foundation",
     "std",
 ] }
