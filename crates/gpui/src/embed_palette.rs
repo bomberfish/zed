@@ -17,21 +17,28 @@ use parking_lot::Mutex;
 /// carries the host's window transparency.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EmbedPalette {
+    /// The packed colors, in the order given above.
     pub colors: [u32; 13],
 }
 
 static PALETTE: Mutex<Option<EmbedPalette>> = Mutex::new(None);
 static VERSION: AtomicU64 = AtomicU64::new(0);
 
-/// Store a new host palette (called by the platform layer). Bumps the version.
+/// Store a new host palette (called by the platform layer). Bumps the version
+/// unless the palette is unchanged: hosts resend it whenever they restyle
+/// themselves, and a version bump costs the app a full theme rebuild.
 pub fn set_embed_palette(palette: EmbedPalette) {
-    *PALETTE.lock() = Some(palette);
+    let mut current = PALETTE.lock();
+    if *current == Some(palette) {
+        return;
+    }
+    *current = Some(palette);
     VERSION.fetch_add(1, Ordering::Release);
 }
 
 /// The current host palette and its monotonic version, if one has been set.
-/// The version changes on each `set_embed_palette`, so a poller can detect
-/// updates without comparing all colors.
+/// The version changes whenever `set_embed_palette` receives new colors, so a
+/// poller can detect updates without comparing all colors.
 pub fn embed_palette() -> Option<(u64, EmbedPalette)> {
     let version = VERSION.load(Ordering::Acquire);
     (*PALETTE.lock()).map(|palette| (version, palette))
