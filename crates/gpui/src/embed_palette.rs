@@ -14,7 +14,11 @@ use parking_lot::Mutex;
 /// Host palette: 13 colors packed as `0xRRGGBBAA`. Order matches slop2's
 /// `Palette`: fg, fg_dim, fg_muted, fg_subtle, bg, bg_alt, accent, accent_alt,
 /// purple, red, green, yellow, yellow_bright. The alpha byte of `bg`/`bg_alt`
-/// carries the host's window transparency.
+/// carries the host's window transparency; zero there means the host paints the
+/// background behind the embed itself and the app is to render over it with no
+/// background of its own (see `apply_embed_palette` in the zed crate). The RGB
+/// bytes stay valid either way, so anything that needs an opaque version of the
+/// color can recover it by setting alpha back to 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EmbedPalette {
     /// The packed colors, in the order given above.

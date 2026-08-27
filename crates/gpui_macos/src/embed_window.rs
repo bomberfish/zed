@@ -128,6 +128,15 @@ struct EmbedWindowState {
     /// Reported by `scale_factor`. The consumer's display scale times the user's
     /// editor multiplier -- 1.0 until it says otherwise.
     scale: f32,
+    /// Whether the frames handed to the consumer carry a background of their own.
+    ///
+    /// A native window would ask the compositor for translucency here. There is no
+    /// compositor on this path — the frame IS the answer — so `Transparent` means
+    /// the renderer clears to transparent black and every pixel the scene did not
+    /// cover leaves the consumer's own background showing through its embed pane.
+    /// `Opaque` clears to opaque black, which is what every embed did before the
+    /// host had a way to ask for anything else.
+    background: WindowBackgroundAppearance,
 
     request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     input: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
@@ -206,6 +215,8 @@ impl EmbedWindow {
             force_frame: true,
             pixels: (width, height),
             scale: 1.0,
+            // Matches `MetalRenderer::new_headless`, which starts opaque.
+            background: WindowBackgroundAppearance::Opaque,
             request_frame: None,
             input: None,
             resize: None,
@@ -523,7 +534,7 @@ impl PlatformWindow for EmbedWindow {
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
-        WindowBackgroundAppearance::Opaque
+        self.0.borrow().background
     }
 
     fn set_title(&mut self, title: &str) {
@@ -539,7 +550,21 @@ impl PlatformWindow for EmbedWindow {
         self.0.borrow().title.clone().unwrap_or_default()
     }
 
-    fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
+    fn set_background_appearance(&self, background: WindowBackgroundAppearance) {
+        let mut state = self.0.borrow_mut();
+        if state.background == background {
+            return;
+        }
+        state.background = background;
+        // `Blurred` has no meaning without a compositor to blur; treat anything
+        // that isn't opaque as "clear to transparent black and let the host decide
+        // what is behind us".
+        let transparent = background != WindowBackgroundAppearance::Opaque;
+        state.renderer.update_transparency(transparent);
+        // The scene has not changed, only what the untouched pixels will hold, so
+        // dirty-tracking would skip the repaint that makes this visible.
+        state.force_frame = true;
+    }
 
     fn minimize(&self) {}
 

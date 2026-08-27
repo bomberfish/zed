@@ -83,6 +83,16 @@ struct HeadlessWindowState {
     hover_status_change: Option<Box<dyn FnMut(bool)>>,
     // Fired when GPUI sets the window title, so the host can mirror it.
     title_change: Option<Box<dyn FnMut(&str)>>,
+    /// Whether the frames handed to the consumer are meant to carry a background
+    /// of their own.
+    ///
+    /// Stored rather than derived because there is no compositor to ask: the frame
+    /// IS the answer, and the offscreen renderer already clears to transparent
+    /// black, so what a `Transparent` theme changes is only whether the scene
+    /// paints an opaque backdrop over that clear. GPUI still reads this back — for
+    /// subpixel-rendering decisions, and to keep a window that asked for
+    /// transparency from being told it is opaque.
+    background: WindowBackgroundAppearance,
 }
 
 #[derive(Clone)]
@@ -168,6 +178,7 @@ impl HeadlessWindow {
             activated: false,
             hover_status_change: None,
             title_change: None,
+            background: WindowBackgroundAppearance::Opaque,
         })))
     }
 
@@ -196,6 +207,7 @@ impl HeadlessWindow {
             activated: false,
             hover_status_change: None,
             title_change: None,
+            background: WindowBackgroundAppearance::Opaque,
         })))
     }
 
@@ -419,7 +431,7 @@ impl PlatformWindow for HeadlessWindow {
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
-        WindowBackgroundAppearance::Opaque
+        self.0.borrow().background
     }
 
     fn set_title(&mut self, title: &str) {
@@ -435,7 +447,16 @@ impl PlatformWindow for HeadlessWindow {
         self.0.borrow().title.clone().unwrap_or_default()
     }
 
-    fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
+    fn set_background_appearance(&self, background: WindowBackgroundAppearance) {
+        let mut state = self.0.borrow_mut();
+        if state.background == background {
+            return;
+        }
+        state.background = background;
+        // The scene has not changed, only what the pixels it does not cover will
+        // hold, so dirty-tracking would skip the repaint that makes this visible.
+        state.force_frame = true;
+    }
 
     fn minimize(&self) {}
 

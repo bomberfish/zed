@@ -102,6 +102,14 @@ struct EmbedWindowState {
     /// Reported by `scale_factor`. The consumer's display scale times the user's
     /// editor multiplier -- 1.0 until it says otherwise.
     scale: f32,
+    /// Whether the frames handed to the consumer carry a background of their own.
+    ///
+    /// A native window would ask DirectComposition for translucency here. There is
+    /// no compositor on this path — the frame IS the answer — so this only reaches
+    /// [`DirectXRenderer::draw`], which clears to transparent black for anything
+    /// that isn't `Opaque` and leaves every pixel the scene did not cover showing
+    /// the consumer's own background through its embed pane.
+    background: WindowBackgroundAppearance,
     /// Sends a fresh handshake after the targets are reallocated: both texture
     /// handles, then the size.
     reshare: Option<Box<dyn FnMut([isize; 2], u32, u32)>>,
@@ -191,6 +199,7 @@ impl EmbedWindow {
             consumer_process,
             pixels: (width, height),
             scale: 1.0,
+            background: WindowBackgroundAppearance::Opaque,
             reshare: None,
             request_frame: None,
             input: None,
@@ -550,7 +559,7 @@ impl PlatformWindow for EmbedWindow {
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
-        WindowBackgroundAppearance::Opaque
+        self.0.borrow().background
     }
 
     fn set_title(&mut self, title: &str) {
@@ -566,7 +575,16 @@ impl PlatformWindow for EmbedWindow {
         self.0.borrow().title.clone().unwrap_or_default()
     }
 
-    fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
+    fn set_background_appearance(&self, background: WindowBackgroundAppearance) {
+        let mut state = self.0.borrow_mut();
+        if state.background == background {
+            return;
+        }
+        state.background = background;
+        // The scene has not changed, only what the pixels it does not cover will
+        // hold, so dirty-tracking would skip the repaint that makes this visible.
+        state.force_frame = true;
+    }
 
     fn minimize(&self) {}
 
@@ -635,10 +653,8 @@ impl PlatformWindow for EmbedWindow {
         // 11on12 layer, and therefore what makes these pixels visible to the
         // consumer's D3D12 device.
         state.shared[index].acquire(&state.devices);
-        state
-            .renderer
-            .draw(scene, WindowBackgroundAppearance::Opaque)
-            .log_err();
+        let background = state.background;
+        state.renderer.draw(scene, background).log_err();
         state.shared[index].release(&state.devices);
 
         // Flush submits, it does not complete: without a value for the consumer

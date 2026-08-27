@@ -248,8 +248,32 @@ fn apply_embed_palette(cx: &mut gpui::App, palette: gpui::embed_palette::EmbedPa
     let yellow = color(11);
     let yellow_bright = color(12);
 
+    // A zero alpha on the two background entries is the host asking for an embed
+    // with no background of its own: the pane it lives in already paints one —
+    // the terminal's, translucent or not — and the editor is to let it through
+    // rather than cover it with a slab of its own. It rides the palette's alpha
+    // because the wire's input tags are fixed-width and a reader cannot skip one
+    // it does not know, so a new tag would break an editor built before it.
+    //
+    // Everything the palette paints a *surface* with then goes through
+    // transparent, which is the point. What can't is anything that stops being
+    // legible without something behind it, handled below: menus and dialogs
+    // float over content, borders ARE the background color, and an ANSI black is
+    // a color a program picked rather than a surface.
+    let transparent = bg.a <= f32::EPSILON;
+    let solid = |c: gpui::Hsla| gpui::Hsla { a: 1.0, ..c };
+    let overlay = |base: gpui::Hsla, a: f32| gpui::Hsla { a, ..base };
+
     let base = cx.theme().clone();
     let mut styles = base.styles.clone();
+    // Set both ways round, not just the transparent one. An embed's background is
+    // the host's business — it owns the pixels behind the pane — so a base theme
+    // that happens to ask for `Blurred` must not decide this on the host's behalf.
+    styles.window_background_appearance = if transparent {
+        gpui::WindowBackgroundAppearance::Transparent
+    } else {
+        gpui::WindowBackgroundAppearance::Opaque
+    };
     {
         let c = &mut styles.colors;
         // Surfaces.
@@ -258,7 +282,9 @@ fn apply_embed_palette(cx: &mut gpui::App, palette: gpui::embed_palette::EmbedPa
         c.editor_gutter_background = bg;
         c.tab_active_background = bg;
         c.surface_background = bg_alt;
-        c.elevated_surface_background = bg_alt;
+        // Context menus, popups and dialogs float over the content they belong to.
+        // Transparent, they would read as two overlapping layers of text.
+        c.elevated_surface_background = solid(bg_alt);
         c.panel_background = bg_alt;
         c.status_bar_background = bg_alt;
         c.title_bar_background = bg_alt;
@@ -266,12 +292,20 @@ fn apply_embed_palette(cx: &mut gpui::App, palette: gpui::embed_palette::EmbedPa
         c.toolbar_background = bg_alt;
         c.tab_bar_background = bg_alt;
         c.tab_inactive_background = bg_alt;
-        // Borders.
-        c.border = bg_alt;
-        c.border_variant = bg_alt;
+        // Borders. Normally `bg_alt` — a border reads as a seam between two
+        // surfaces of slightly different color. With no surfaces to seam it has to
+        // become a mark of its own, or every pane divider and rule in the window
+        // disappears at once.
+        let seam = if transparent {
+            overlay(fg, 0.14)
+        } else {
+            bg_alt
+        };
+        c.border = seam;
+        c.border_variant = seam;
         c.border_focused = accent;
         c.border_selected = accent;
-        c.pane_group_border = bg_alt;
+        c.pane_group_border = seam;
         c.pane_focused_border = accent;
         // Text + icons.
         c.text = fg;
@@ -289,7 +323,6 @@ fn apply_embed_palette(cx: &mut gpui::App, palette: gpui::embed_palette::EmbedPa
         // Line + element highlight backgrounds. Translucent overlays (not solid
         // palette colors) so a hovered/active line reads correctly over *any*
         // surface — a solid bg_alt would vanish on panels already using bg_alt.
-        let overlay = |base: gpui::Hsla, a: f32| gpui::Hsla { a, ..base };
         c.editor_active_line_background = overlay(fg, 0.06);
         c.editor_highlighted_line_background = overlay(accent, 0.12);
         c.element_hover = overlay(fg, 0.08);
@@ -304,7 +337,8 @@ fn apply_embed_palette(cx: &mut gpui::App, palette: gpui::embed_palette::EmbedPa
         c.terminal_foreground = fg;
         c.terminal_bright_foreground = fg;
         c.terminal_dim_foreground = fg_muted;
-        c.terminal_ansi_black = bg;
+        // A program that asked for black wants black, not a hole in the window.
+        c.terminal_ansi_black = solid(bg);
         c.terminal_ansi_red = red;
         c.terminal_ansi_green = green;
         c.terminal_ansi_yellow = yellow;
@@ -322,6 +356,7 @@ fn apply_embed_palette(cx: &mut gpui::App, palette: gpui::embed_palette::EmbedPa
         c.terminal_ansi_bright_white = fg;
     }
 
+    let appearance = styles.window_background_appearance;
     let theme = Theme {
         id: "slop-embed".to_string(),
         name: "Slop".into(),
@@ -329,6 +364,19 @@ fn apply_embed_palette(cx: &mut gpui::App, palette: gpui::embed_palette::EmbedPa
         styles,
     };
     GlobalTheme::update_theme(cx, std::sync::Arc::new(theme));
+
+    // Nothing else pushes this on a theme change: the workspace only syncs a
+    // window's background appearance when the settings store changes, and a new
+    // theme is not a settings change. Without it the renderer keeps clearing the
+    // frame opaque and the transparent surfaces above have nothing to reveal.
+    for &mut window in cx.windows().iter_mut() {
+        window
+            .update(cx, |_, window, _| {
+                window.set_background_appearance(appearance)
+            })
+            .ok();
+    }
+
     cx.refresh_windows();
 }
 
